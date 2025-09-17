@@ -200,63 +200,66 @@ $compromised = @{
 Write-Host ""
 Write-Host 'Searching for compromised NPM packages in lockfiles...' -ForegroundColor Cyan
 
-# Lockfiles suchen (robust & portabel)
+# Lockfiles suchen
 $lockfiles = Get-ChildItem -Recurse -File | Where-Object {
     $_.Name -in @("package-lock.json", "yarn.lock", "pnpm-lock.yaml")
 }
 
-$found = $false
-
-# Vorberechnung: wie viele Prüfungen insgesamt
-$totalChecks = 0
-foreach ($pkg in $compromised.Keys) {
-    $totalChecks += $compromised[$pkg].Count * $lockfiles.Count
+if (-not $lockfiles) {
+    Write-Host "No lockfiles found." -ForegroundColor Yellow
+    exit
 }
 
-$currentCheck = 0
-$lastProgress = -1
+$found = $false
 
-foreach ($file in $lockfiles) {
-    $lines = Get-Content $file.FullName
-
-    foreach ($pkg in $compromised.Keys) {
-        foreach ($ver in $compromised[$pkg]) {
-            $currentCheck++
-
-            # Fortschritt berechnen
-            $percent = [math]::Floor(($currentCheck / $totalChecks) * 100)
-
-            # Nur in 1%-Schritten aktualisieren
-            if ($percent -ge $lastProgress + 1 -and $percent -le 100) {
-                Write-Progress -Activity "Checking lockfiles for compromised packages..." `
-                               -Status "$percent% completed" `
-                               -PercentComplete $percent
-                $lastProgress = $percent
-            }
-
-            $pattern1 = '"' + [regex]::Escape($pkg) + '"\s*:\s*"' + [regex]::Escape($ver) + '"'
-            $pattern2 = '^' + [regex]::Escape($pkg) + '@' + [regex]::Escape($ver) + '\b'
-
-            $allMatches = @()
-            $allMatches += $lines | Select-String -Pattern $pattern1
-            $allMatches += $lines | Select-String -Pattern $pattern2
-
-            if ($allMatches.Count -gt 0) {
-                Write-Host ""
-                $line = "[!] Found in: $($file.FullName)"
-                Write-Host $line -ForegroundColor Red
-                $allMatches | ForEach-Object { Write-Host $_.Line -ForegroundColor Yellow }
-                $found = $true
-            }
-        }
+# -------- Pattern vorbereiten --------
+$patterns = @()
+foreach ($pkg in $compromised.Keys) {
+    foreach ($ver in $compromised[$pkg]) {
+        # JSON-Pattern
+        $patterns += '"' + [regex]::Escape($pkg) + '"\s*:\s*"' + [regex]::Escape($ver) + '"'
+        # yarn.lock-Pattern
+        $patterns += '^' + [regex]::Escape($pkg) + '@' + [regex]::Escape($ver) + '\b'
     }
 }
 
-if (-not $found) {
-    Write-Host ""
-    Write-Host 'No compromised packages found in lockfiles..' -ForegroundColor Green
-} else {
-    Write-Host ""
-    Write-Host 'Please remove the affected packages and regenerate the lockfiles.!' -ForegroundColor Magenta
+# Kombinierte Regex (| = oder)
+$bigPattern = ($patterns -join "|")
+
+$totalFiles   = $lockfiles.Count
+$currentFile  = 0
+$lastProgress = -1
+
+foreach ($file in $lockfiles) {
+    $currentFile++
+
+    $percent = [math]::Floor(($currentFile / $totalFiles) * 100)
+    if ($percent -ge $lastProgress + 1 -and $percent -le 100) {
+        Write-Progress -Activity "Checking lockfiles for compromised packages..." `
+                       -Status "$percent% completed" `
+                       -PercentComplete $percent
+        $lastProgress = $percent
+    }
+
+    # nur ein Select-String pro Datei
+    $matches = Select-String -Path $file.FullName -Pattern $bigPattern -AllMatches
+    if ($matches) {
+        Write-Host ""
+        Write-Host "[!] Found in: $($file.FullName)" -ForegroundColor Red
+        foreach ($m in $matches) {
+            Write-Host $m.Line -ForegroundColor Yellow
+        }
+        $found = $true
+    }
 }
 
+Write-Progress -Activity "Checking lockfiles for compromised packages..." `
+               -Status "100% completed" -PercentComplete 100
+
+if (-not $found) {
+    Write-Host ""
+    Write-Host 'No compromised packages found in lockfiles.' -ForegroundColor Green
+} else {
+    Write-Host ""
+    Write-Host 'Please remove the affected packages and regenerate the lockfiles!' -ForegroundColor Magenta
+}
