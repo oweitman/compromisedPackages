@@ -198,7 +198,7 @@ $compromised = @{
 }
 
 Write-Host ""
-Write-Host 'Suche kompromittierte NPM-Pakete in Lockfiles...' -ForegroundColor Cyan
+Write-Host 'Searching for compromised NPM packages in lockfiles...' -ForegroundColor Cyan
 
 # Lockfiles suchen (robust & portabel)
 $lockfiles = Get-ChildItem -Recurse -File | Where-Object {
@@ -228,8 +228,8 @@ foreach ($file in $lockfiles) {
 
             # Nur in 1%-Schritten aktualisieren
             if ($percent -ge $lastProgress + 1 -and $percent -le 100) {
-                Write-Progress -Activity "Prüfe Lockfiles auf kompromittierte Pakete..." `
-                               -Status "$percent% abgeschlossen" `
+                Write-Progress -Activity "Checking lockfiles for compromised packages..." `
+                               -Status "$percent% completed" `
                                -PercentComplete $percent
                 $lastProgress = $percent
             }
@@ -243,7 +243,7 @@ foreach ($file in $lockfiles) {
 
             if ($allMatches.Count -gt 0) {
                 Write-Host ""
-                $line = "[!] Gefunden in: $($file.FullName)"
+                $line = "[!] Found in: $($file.FullName)"
                 Write-Host $line -ForegroundColor Red
                 $allMatches | ForEach-Object { Write-Host $_.Line -ForegroundColor Yellow }
                 $found = $true
@@ -254,9 +254,9 @@ foreach ($file in $lockfiles) {
 
 if (-not $found) {
     Write-Host ""
-    Write-Host 'Keine kompromittierten Pakete in Lockfiles gefunden.' -ForegroundColor Green
+    Write-Host 'No compromised packages found in lockfiles..' -ForegroundColor Green
 } else {
     Write-Host ""
-    Write-Host 'Bitte betroffene Pakete entfernen und Lockfiles neu erzeugen!' -ForegroundColor Magenta
+    Write-Host 'Please remove the affected packages and regenerate the lockfiles.!' -ForegroundColor Magenta
 }
 

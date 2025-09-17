@@ -201,12 +201,12 @@ compromised=(
 )
 
 
-echo "🔍 Durchsuche Lockfiles in $(pwd) nach kompromittierten NPM-Paketen..."
+echo "🔍 Scanning lockfiles in $(pwd) for compromised NPM packages..."
 
 # Lockfiles sammeln (package-lock.json, yarn.lock, pnpm-lock.yaml)
 mapfile -t lockfiles < <(find . -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" \))
 if (( ${#lockfiles[@]} == 0 )); then
-  echo "Keine Lockfiles gefunden."
+  echo "No lockfiles found."
   exit 0
 fi
 
@@ -215,7 +215,7 @@ is_tty=0; [ -t 1 ] && is_tty=1
 progress_print() {
   local percent="$1"
   if (( is_tty )); then
-    printf "\r[Progress] %3d%% abgeschlossen" "$percent"
+    printf "\r[Progress] %3d% complete" "$percent"
     (( percent >= 100 )) && printf "\n"
   else
     echo "[Progress] ${percent}%"
@@ -229,7 +229,7 @@ for pkg in "${!compromised[@]}"; do
   (( total_versions += ${#_vers[@]} ))
 done
 total_checks=$(( total_versions * ${#lockfiles[@]} ))
-(( total_checks == 0 )) && { echo "Nichts zu prüfen."; exit 0; }
+(( total_checks == 0 )) && { echo "Nothing to check."; exit 0; }
 
 found=0
 done_checks=0
@@ -273,7 +273,7 @@ done
 # progress_print 100
 
 if (( found == 0 )); then
-  echo "✅ Keine kompromittierten Pakete in Lockfiles gefunden."
+  echo "✅ No compromised packages found in lockfiles."
 else
-  echo "⚠️ Bitte betroffene Pakete entfernen und Lockfiles neu erzeugen!"
+  echo "⚠️ Please remove the affected packages and regenerate the lockfiles!"
 fi
