@@ -2,6 +2,10 @@
 
 ## Execute
 
+Please navigate to the directory containing the package-lock.json / yarn.lock / pnpm-lock.yaml file and run one of the following commands.
+
+For iobroker, this is the directory /opt/iobroker (or, for Windows, to be added later).
+
 ### Debian/Bash
 
 ```bash
