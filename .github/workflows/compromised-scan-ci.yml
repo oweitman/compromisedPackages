@@ -336,30 +336,50 @@ jobs:
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
                   Copy-Item package-lock.bad.json package-lock.json -Force
 
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt"
-                  $text = $out -join "`n"
-                  Set-Content -Path pwsh_bad.txt -Value $text -NoNewline
+                  # Alle Streams -> StdOut (fängt auch Write-Host ein)
+                  $out = & .\compromised.ps1 `
+                      -Cache "$PWD\compromised-packages.txt" `
+                      -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
+                      *>&1
 
-                  $match = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
-                  if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
-                    Write-Host $text
-                    throw "Expected at least one match with BAD fixture"
+                  # $out ist ein Objekt-Array; robust in String wandeln:
+                  $text = ($out | ForEach-Object { $_ | Out-String }).TrimEnd()
+
+                  # Optional: ins Artefakt schreiben
+                  Set-Content -Path pwsh_bad.txt -Value $text
+
+                  if ($text -match 'Total:\s+(\d+)\s+match\(es\)') {
+                      $total = [int]$Matches[1]
+                      "Parsed total: $total"
+                      if ($total -lt 1) {
+                        throw "Expected at least one match with BAD fixture (got $total)"
+                      }
+                  } else {
+                      # Fallback: rohen Text zeigen
+                      Write-Host $text
+                      throw "Did not find a 'Total: N match(es)' line in BAD output"
                   }
 
             - name: Run PowerShell scanner on GOOD (force local list)
               shell: pwsh
               run: |
                   Copy-Item package-lock.good.json package-lock.json -Force
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt"
-                  $text = $out -join "`n"
-                  Set-Content -Path pwsh_good.txt -Value $text -NoNewline
+
+                  $out = & .\compromised.ps1 `
+                      -Cache "$PWD\compromised-packages.txt" `
+                      -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
+                      *>&1
+
+                  $text = ($out | ForEach-Object { $_ | Out-String }).TrimEnd()
+                  Set-Content -Path pwsh_good.txt -Value $text
+
                   if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
-                    Write-Host $text
-                    throw "Expected zero matches with GOOD fixture"
+                      Write-Host $text
+                      throw "Expected zero matches with GOOD fixture"
                   }
                   if ($text -notmatch 'No compromised packages found in lockfiles') {
-                    Write-Host $text
-                    throw "Expected the ''No compromised packages'' message in GOOD fixture"
+                      Write-Host $text
+                      throw "Expected the 'No compromised packages found in lockfiles' message in GOOD output"
                   }
 
             - name: Upload logs (Windows)
