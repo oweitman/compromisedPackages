@@ -1,17 +1,21 @@
-name: Compromised package scanners (Bash & PowerShell)
+name: Compromised scanners CI
 
 on:
     pull_request:
         paths:
             - 'compromised-packages.txt'
+            - 'scripts/generate-fixtures.sh'
+            - 'tests/fixtures/package-lock.*.json'
+            - 'compromised.sh'
+            - 'compromised.ps1'
     workflow_dispatch:
 
 permissions:
     contents: read
 
 jobs:
-    linux-bash:
-        name: Bash scanner on Ubuntu
+    validate-fixtures:
+        name: Validate fixtures vs current list
         runs-on: ubuntu-latest
         steps:
             - name: Checkout PR head
@@ -19,75 +23,66 @@ jobs:
               with:
                   ref: ${{ github.event.pull_request.head.sha }}
 
-            - name: Show list stats
-              run: |
-                  echo "Lines (non-comment): $(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | wc -l)"
-                  head -n 10 compromised-packages.txt || true
-
-            - name: Generate synthetic package-lock.json from the list (first 3 entries)
-              shell: bash
+            - name: Regenerate fixtures to tmp
               run: |
                   set -euo pipefail
-                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | head -n 3)
-                  if (( ${#entries[@]} == 0 )); then
-                    echo "No entries in list; nothing to test." >&2
+                  mkdir -p tmp-fixtures
+                  cp scripts/generate-fixtures.sh ./tmp-fixtures/
+                  bash ./tmp-fixtures/generate-fixtures.sh
+                  echo "--- DIFF bad.json ---"
+                  diff -u tests/fixtures/package-lock.bad.json tests/fixtures/package-lock.bad.json || true
+                  echo "--- DIFF good.json ---"
+                  diff -u tests/fixtures/package-lock.good.json tests/fixtures/package-lock.good.json || true
+
+            - name: Check fixtures up-to-date
+              run: |
+                  set -euo pipefail
+                  bash scripts/generate-fixtures.sh
+                  if ! diff -u tests/fixtures/package-lock.bad.json tests/fixtures/package-lock.bad.json >/dev/null; then
+                    echo "Fixture package-lock.bad.json is outdated. Run scripts/generate-fixtures.sh and commit." >&2
                     exit 1
                   fi
-                  echo '{' > package-lock.json
-                  echo '  "name": "ci-test",' >> package-lock.json
-                  echo '  "version": "1.0.0",' >> package-lock.json
-                  echo '  "lockfileVersion": 2,' >> package-lock.json
-                  echo '  "requires": true,' >> package-lock.json
-                  echo '  "packages": {' >> package-lock.json
-                  echo '    "": { "name": "ci-test", "version": "1.0.0" },' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    # node_modules block
-                    printf '    "node_modules/%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  },' >> package-lock.json
-                  echo '  "dependencies": {' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    printf '    "%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  },' >> package-lock.json
-                  echo '  "flat_versions": {' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    printf '    "%s": "%s",\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  }' >> package-lock.json
-                  echo '}' >> package-lock.json
+                  if ! diff -u tests/fixtures/package-lock.good.json tests/fixtures/package-lock.good.json >/dev/null; then
+                    echo "Fixture package-lock.good.json is outdated. Run scripts/generate-fixtures.sh and commit." >&2
+                    exit 1
+                  fi
+        outputs:
+            ok: true
 
-                  echo "package-lock.json preview:"
-                  sed -n '1,80p' package-lock.json
+    linux-bash:
+        name: Bash scanner (Ubuntu)
+        needs: validate-fixtures
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout PR head
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.pull_request.head.sha }}
 
-            - name: Run Bash scanner (force cache, avoid network)
-              shell: bash
-              run: |
-                  chmod +x ./compromised.sh
-                  # Use local list via --cache-file; give an invalid URL to trigger cache fallback if needed
-                  set -o pipefail
-                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.localhost/list 2>&1 | tee bash_run.txt
-                  echo "---- tail ----"
-                  tail -n 20 bash_run.txt
+            - name: Ensure executable
+              run: chmod +x ./compromised.sh
 
-            - name: Assert Bash found at least 1 match
-              shell: bash
+            - name: Test BAD fixture (should find >=1)
               run: |
                   set -euo pipefail
-                  total=$(grep -Eo '^Total: [0-9]+' bash_run.txt | awk '{print $2}' | tail -n1)
-                  if [[ -z "${total:-}" ]]; then
-                    echo "Could not parse Total from Bash output"; cat bash_run.txt; exit 1
-                  fi
-                  echo "Total matches (Bash): $total"
-                  if (( total < 1 )); then
-                    echo "Bash scanner reported zero matches"; exit 1
+                  cp tests/fixtures/package-lock.bad.json package-lock.json
+                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_bad.txt
+                  total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1)
+                  echo "Bash BAD total=${total:-nil}"
+                  [[ -n "${total:-}" && "$total" -ge 1 ]]
+
+            - name: Test GOOD fixture (should find 0)
+              run: |
+                  set -euo pipefail
+                  cp tests/fixtures/package-lock.good.json package-lock.json
+                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_good.txt
+                  if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
+                    echo "Expected 0 matches on GOOD fixture"; exit 1
                   fi
 
     windows-pwsh:
-        name: PowerShell scanner on Windows
+        name: PowerShell scanner (Windows)
+        needs: validate-fixtures
         runs-on: windows-latest
         steps:
             - name: Checkout PR head
@@ -95,61 +90,26 @@ jobs:
               with:
                   ref: ${{ github.event.pull_request.head.sha }}
 
-            - name: Generate synthetic package-lock.json from the list (first 3 entries)
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | head -n 3)
-                  if (( ${#entries[@]} == 0 )); then
-                    echo "No entries in list; nothing to test." >&2
-                    exit 1
-                  fi
-                  echo '{' > package-lock.json
-                  echo '  "name": "ci-test",' >> package-lock.json
-                  echo '  "version": "1.0.0",' >> package-lock.json
-                  echo '  "lockfileVersion": 2,' >> package-lock.json
-                  echo '  "requires": true,' >> package-lock.json
-                  echo '  "packages": {' >> package-lock.json
-                  echo '    "": { "name": "ci-test", "version": "1.0.0" },' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    printf '    "node_modules/%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  },' >> package-lock.json
-                  echo '  "dependencies": {' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    printf '    "%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  },' >> package-lock.json
-                  echo '  "flat_versions": {' >> package-lock.json
-                  for l in "${entries[@]}"; do
-                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
-                    printf '    "%s": "%s",\n' "$pkg" "$vers" >> package-lock.json
-                  done
-                  echo '  }' >> package-lock.json
-                  echo '}' >> package-lock.json
-
-            - name: Run PowerShell scanner (force cache, avoid network)
+            - name: Test BAD fixture (should find >=1)
               shell: pwsh
               run: |
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-                  if (-not (Test-Path .\compromised.ps1)) { Write-Error "compromised.ps1 not found"; exit 1 }
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.localhost/list" 2>&1
-                  $out | Tee-Object -FilePath pwsh_run.txt
-                  Write-Host "---- tail ----"
-                  Get-Content pwsh_run.txt | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+                  Copy-Item tests/fixtures/package-lock.bad.json -Destination package-lock.json -Force
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
+                  $out | Tee-Object -FilePath pwsh_bad.txt
+                  $m = [regex]::Match(($out -join "`n"), 'Total:\s+(\d+)\s+match\(es\)')
+                  if (-not $m.Success -or [int]$m.Groups[1].Value -lt 1) {
+                    Write-Host ($out -join "`n")
+                    throw "Expected >=1 matches on BAD fixture"
+                  }
 
-            - name: Assert PowerShell found at least 1 match
+            - name: Test GOOD fixture (should find 0)
               shell: pwsh
               run: |
-                  $content = Get-Content pwsh_run.txt -Raw
-                  # Match: "Total: N match(es)"
-                  $m = [regex]::Match($content, 'Total:\s+(\d+)\s+match\(es\)')
-                  if (-not $m.Success) {
-                    Write-Host $content
-                    throw "Could not parse Total from PowerShell output"
+                  Copy-Item tests/fixtures/package-lock.good.json -Destination package-lock.json -Force
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
+                  $out | Tee-Object -FilePath pwsh_good.txt
+                  if (($out -join "`n") -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
+                    Write-Host ($out -join "`n")
+                    throw "Expected 0 matches on GOOD fixture"
                   }
-                  $total = [int]$m.Groups[1].Value
-                  Write-Host ("Total matches (PowerShell): {0}" -f $total)
-                  if ($total -lt 1) { throw "PowerShell scanner reported zero matches" }
