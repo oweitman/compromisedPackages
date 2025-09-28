@@ -104,13 +104,45 @@ jobs:
                   if-no-files-found: error
                   retention-days: 14
 
-            - name: Run Bash scanner on BAD fixture (should find at least one match)
+            - name: Diagnose sizes & hashes after generation (Linux)
               shell: bash
               run: |
                   set -euo pipefail
-                  cp package-lock.bad.json package-lock.json
-                  # Nur lokale Liste verwenden (kein externer Download)
+                  for f in package-lock.bad.json package-lock.good.json; do
+                    echo "== $f =="
+                    wc -c < "$f" | awk '{print "bytes:",$1}'
+                    md5sum "$f" | awk '{print "md5:",$1}'
+                    sha256sum "$f" | awk '{print "sha256:",$1}'
+                    printf 'file(1): '; file -b "$f" || true
+                    echo "First 128 bytes (hex):"; xxd -g 1 -l 128 "$f" || true
+                    echo
+                  done
+
+            - name: Run Bash scanner on BAD fixture (with deep verify)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cp -f package-lock.bad.json package-lock.json
+
+                  echo "== Verify copied package-lock.json (BAD) =="
+                  echo -n "bytes: "; wc -c < package-lock.json
+                  echo -n "md5:   "; md5sum package-lock.json | awk '{print $1}'
+                  echo -n "sha256:"; sha256sum package-lock.json | awk '{print $1}'
+                  echo "cmp vs. package-lock.bad.json:"
+                  if cmp -s package-lock.bad.json package-lock.json; then
+                    echo "IDENTICAL"
+                  else
+                    echo "DIFFERS"
+                    echo "--- diff -u ---"
+                    diff -u package-lock.bad.json package-lock.json || true
+                    echo "--- hexdump A (bad) ---"; xxd -g 1 -l 256 package-lock.bad.json || true
+                    echo "--- hexdump B (used) ---"; xxd -g 1 -l 256 package-lock.json || true
+                  fi
+                  echo "file(1): $(file -b package-lock.json || true)"
+                  echo "CR (0x0D) count:"; tr -cd '\r' < package-lock.json | wc -c | awk '{print $1}'
+
                   ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_bad.txt
+
                   total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || echo "")
                   echo "Total matches in BAD fixture: ${total:-0}"
                   if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
@@ -118,12 +150,35 @@ jobs:
                     exit 1
                   fi
 
-            - name: Run Bash scanner on GOOD fixture (should find zero matches)
+            - name: Upload scanned BAD file (exact input)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-scanned-bad-input
+                  path: package-lock.json
+                  if-no-files-found: error
+                  retention-days: 14
+
+            - name: Run Bash scanner on GOOD fixture (with deep verify)
               shell: bash
               run: |
                   set -euo pipefail
-                  cp package-lock.good.json package-lock.json
-                  # Nur lokale Liste verwenden (kein externer Download)
+                  cp -f package-lock.good.json package-lock.json
+
+                  echo "== Verify copied package-lock.json (GOOD) =="
+                  echo -n "bytes: "; wc -c < package-lock.json
+                  echo -n "md5:   "; md5sum package-lock.json | awk '{print $1}'
+                  echo -n "sha256:"; sha256sum package-lock.json | awk '{print $1}'
+                  echo "cmp vs. package-lock.good.json:"
+                  if cmp -s package-lock.good.json package-lock.json; then
+                    echo "IDENTICAL"
+                  else
+                    echo "DIFFERS"
+                    echo "--- diff -u ---"
+                    diff -u package-lock.good.json package-lock.json || true
+                    echo "--- hexdump A (good) ---"; xxd -g 1 -l 256 package-lock.good.json || true
+                    echo "--- hexdump B (used) ---"; xxd -g 1 -l 256 package-lock.json || true
+                  fi
+
                   ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_good.txt
                   if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
                     echo "Expected zero matches with GOOD fixture" >&2
@@ -131,7 +186,15 @@ jobs:
                   fi
                   grep -q 'No compromised packages found in lockfiles' bash_good.txt
 
-            - name: Upload logs
+            - name: Upload scanned GOOD file (exact input)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-scanned-good-input
+                  path: package-lock.json
+                  if-no-files-found: error
+                  retention-days: 14
+
+            - name: Upload logs (Linux)
               uses: actions/upload-artifact@v4
               with:
                   name: linux-logs
@@ -220,26 +283,94 @@ jobs:
                   if-no-files-found: error
                   retention-days: 14
 
-            - name: Run PowerShell scanner on BAD fixture (should find at least one match)
+            - name: Diagnose sizes & hashes after generation (Windows)
               shell: pwsh
               run: |
+                  Set-StrictMode -Version Latest
+                  foreach ($f in 'package-lock.bad.json','package-lock.good.json') {
+                    Write-Host "== $f =="
+                    $bytes = (Get-Item $f).Length
+                    "bytes: $bytes"
+                    "md5:   " + (Get-FileHash -Path $f -Algorithm MD5).Hash.ToLower()
+                    "sha256:" + (Get-FileHash -Path $f -Algorithm SHA256).Hash.ToLower()
+                    "First 128 bytes (hex):"
+                    Format-Hex -Path $f -Count 128 | Out-String | Write-Host
+                    ""
+                  }
+
+            - name: Run PowerShell scanner on BAD fixture (with deep verify)
+              shell: pwsh
+              run: |
+                  Set-StrictMode -Version Latest
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-                  Copy-Item package-lock.bad.json -Destination package-lock.json -Force
-                  # Nur lokale Liste verwenden (kein externer Download)
+                  Copy-Item package-lock.bad.json package-lock.json -Force
+
+                  Write-Host "== Verify copied package-lock.json (BAD) =="
+                  "bytes: " + (Get-Item package-lock.json).Length
+                  "md5:   " + (Get-FileHash -Path package-lock.json -Algorithm MD5).Hash.ToLower()
+                  "sha256:" + (Get-FileHash -Path package-lock.json -Algorithm SHA256).Hash.ToLower()
+
+                  # Byte-genauer Vergleich
+                  $cmp = & fc.exe /b package-lock.bad.json package-lock.json
+                  if ($LASTEXITCODE -eq 0) {
+                    "IDENTICAL"
+                  } else {
+                    "DIFFERS"
+                    "=== fc /b output ==="
+                    $cmp | Out-String | Write-Host
+                    "=== hexdump A (bad) ==="
+                    Format-Hex -Path package-lock.bad.json -Count 256 | Out-String | Write-Host
+                    "=== hexdump B (used) ==="
+                    Format-Hex -Path package-lock.json -Count 256 | Out-String | Write-Host
+                  }
+
+                  # CR (0x0D) zählen
+                  $bytes = [System.IO.File]::ReadAllBytes("package-lock.json")
+                  "CR-count: " + ($bytes | Where-Object { $_ -eq 13 }).Count
+
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
                   $text = $out -join "`n"
                   Set-Content -Path pwsh_bad.txt -Value $text -NoNewline
+
                   $match = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
                   if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
                     Write-Host $text
                     throw "Expected at least one match with BAD fixture"
                   }
 
-            - name: Run PowerShell scanner on GOOD fixture (should find zero matches)
+            - name: Upload scanned BAD file (exact input)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-scanned-bad-input
+                  path: package-lock.json
+                  if-no-files-found: error
+                  retention-days: 14
+
+            - name: Run PowerShell scanner on GOOD fixture (with deep verify)
               shell: pwsh
               run: |
-                  Copy-Item package-lock.good.json -Destination package-lock.json -Force
-                  # Nur lokale Liste verwenden (kein externer Download)
+                  Set-StrictMode -Version Latest
+                  Copy-Item package-lock.good.json package-lock.json -Force
+
+                  Write-Host "== Verify copied package-lock.json (GOOD) =="
+                  "bytes: " + (Get-Item package-lock.json).Length
+                  "md5:   " + (Get-FileHash -Path package-lock.json -Algorithm MD5).Hash.ToLower()
+                  "sha256:" + (Get-FileHash -Path package-lock.json -Algorithm SHA256).Hash.ToLower()
+
+                  $cmp = & fc.exe /b package-lock.good.json package-lock.json
+                  if ($LASTEXITCODE -eq 0) {
+                    "IDENTICAL"
+                  } else
+                    {
+                      "DIFFERS"
+                      "=== fc /b output ==="
+                      $cmp | Out-String | Write-Host
+                      "=== hexdump A (good) ==="
+                      Format-Hex -Path package-lock.good.json -Count 256 | Out-String | Write-Host
+                      "=== hexdump B (used) ==="
+                      Format-Hex -Path package-lock.json -Count 256 | Out-String | Write-Host
+                    }
+
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
                   $text = $out -join "`n"
                   Set-Content -Path pwsh_good.txt -Value $text -NoNewline
@@ -252,7 +383,15 @@ jobs:
                     throw "Expected the ''No compromised packages'' message in GOOD fixture"
                   }
 
-            - name: Upload logs
+            - name: Upload scanned GOOD file (exact input)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-scanned-good-input
+                  path: package-lock.json
+                  if-no-files-found: error
+                  retention-days: 14
+
+            - name: Upload logs (Windows)
               uses: actions/upload-artifact@v4
               with:
                   name: windows-logs
