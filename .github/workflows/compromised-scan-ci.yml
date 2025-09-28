@@ -171,6 +171,8 @@ jobs:
 
             - name: Run Bash scanner on BAD (force local list + verify)
               shell: bash
+              env:
+                  DEBUG: '1'
               run: |
                   set -euo pipefail
                   cp -f package-lock.bad.json package-lock.json
