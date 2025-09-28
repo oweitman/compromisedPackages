@@ -35,40 +35,97 @@ function Test-IsHtmlPreview {
   return ($joined -match '<!doctype|<html|<head')
 }
 
+# normalize a file:// URL to a local path
+function Convert-FileUrlToLocalPath {
+  param([string]$Url)
+  # strip scheme
+  $local = $Url -replace '^[Ff][Ii][Ll][Ee]:\/\/\/?', ''
+  # decode %-escapes
+  try {
+    $local = [System.Uri]::UnescapeDataString($local)
+  } catch {
+    # ignore decode errors
+  }
+  # On Windows, convert forward slashes to backslashes for Test-Path friendly path
+  if ($IsWindows) { $local = $local -replace '/', '\' }
+  return $local
+}
+
 function Get-ListLines {
   param(
     [string]$Url,
     [string]$CacheFile
   )
+
   Write-Host ("Downloading compromised package list from: {0}" -f $Url)
 
-  $lines = $null
+  # If the URL is a local file URL (file://), treat it specially
+  if ($Url -match '^[Ff][Ii][Ll][Ee]:\/\/\/?') {
+    $localPath = Convert-FileUrlToLocalPath -Url $Url
+    if (-not (Test-Path -LiteralPath $localPath)) {
+      throw "Local list file not found: $localPath"
+    }
 
+    # If a cache path is requested, copy into the cache (keeps behavior consistent)
+    if ($CacheFile) {
+      try {
+        Copy-Item -LiteralPath $localPath -Destination $CacheFile -Force
+        Write-Host ("List copied from local file to cache at: {0}" -f $CacheFile)
+        $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
+      } catch {
+        throw "Failed to copy local list to cache: $_"
+      }
+    } else {
+      # read directly
+      try {
+        $lines = Get-Content -LiteralPath $localPath -ErrorAction Stop
+      } catch {
+        throw "Failed to read local list file: $_"
+      }
+    }
+
+    if ($ShowContent) {
+      Write-Host ""
+      Write-Host ("--- First {0} lines of the list ---" -f $ShowLines)
+      ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }
+      Write-Host "--- End ---`n"
+    }
+
+    return $lines
+  }
+
+  # Non-file URL: use HTTP(S) download and optionally cache
+  $lines = $null
   if ($CacheFile) {
     $tmp = "$CacheFile.tmp"
     try {
-      Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $tmp
-      $head = Get-Content $tmp -TotalCount 6
+      # Use Invoke-WebRequest for HTTP/HTTPS
+      Invoke-WebRequest -Uri $Url -OutFile $tmp -ErrorAction Stop
+      $head = Get-Content -LiteralPath $tmp -TotalCount 6 -ErrorAction Stop
       if (Test-IsHtmlPreview $head) {
         Write-Warning "Download looks like HTML/Preview."
-        Remove-Item $tmp -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
         if (Test-Path $CacheFile) {
-          $lines = Get-Content $CacheFile -ErrorAction Stop
-          Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
+          try {
+            $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
+            Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
+          } catch {
+            throw "Failed to load list from URL and cache."
+          }
         } else {
           throw "No valid content and no cache available."
         }
       } else {
-        Move-Item -Force $tmp $CacheFile
-        $lines = Get-Content $CacheFile -ErrorAction Stop
+        Move-Item -Force -LiteralPath $tmp -Destination $CacheFile
+        $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
         Write-Host ("List successfully downloaded and cached at: {0}" -f $CacheFile)
       }
     } catch {
-      if (Test-Path $tmp) { Remove-Item $tmp -ErrorAction SilentlyContinue }
+      if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
       if (-not $lines) {
         if (Test-Path $CacheFile) {
           try {
-            $lines = Get-Content $CacheFile -ErrorAction Stop
+            $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
             Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
           } catch {
             throw "Failed to load list from URL and cache."
@@ -79,18 +136,19 @@ function Get-ListLines {
       }
     }
   } else {
+    # no cache specified: download to tmp and return
+    $tmp = New-TemporaryFile
     try {
-      $tmp = New-TemporaryFile
-      Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $tmp
-      $head = Get-Content $tmp -TotalCount 6
+      Invoke-WebRequest -Uri $Url -OutFile $tmp -ErrorAction Stop
+      $head = Get-Content -LiteralPath $tmp -TotalCount 6 -ErrorAction Stop
       if (Test-IsHtmlPreview $head) {
-        Remove-Item $tmp -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
         throw "Download looks like HTML/Preview. Aborting."
       }
-      $lines = Get-Content $tmp -ErrorAction Stop
-      Remove-Item $tmp -ErrorAction SilentlyContinue
+      $lines = Get-Content -LiteralPath $tmp -ErrorAction Stop
+      Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
     } catch {
-      if ($tmp) { Remove-Item $tmp -ErrorAction SilentlyContinue }
+      if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
       throw
     }
   }
@@ -149,7 +207,8 @@ function Test-FlatJsonMatch {
   param([string]$Text, [string]$Pkg, [string]$Ver)
   $pkgRe = Escape-Regex $Pkg
   $verRe = Escape-Regex $Ver
-  $pattern = ('"{0}"\s*:\s*"{1}"(?:\s*,|\s*)$' -f $pkgRe, $verRe)
+  # allow optional trailing comma or whitespace (tolerant)
+  $pattern = ('"{0}"\s*:\s*"{1}"(?:\s*,|\s*)\r?$' -f $pkgRe, $verRe)
   return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
 }
 
@@ -158,7 +217,7 @@ function Test-DependenciesBlock {
   param([string]$Text, [string]$Pkg, [string]$Ver)
   $pkgRe = Escape-Regex $Pkg
   $verRe = Escape-Regex $Ver
-  # Use Singleline to span across newlines; double braces to emit literal { } in format string
+  # Use Singleline to span across newlines
   $pattern = ('"{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe)
   return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
 }
@@ -221,7 +280,7 @@ $lastShown = -1
 # Cache file contents for faster matching
 $fileTexts = @{}
 foreach ($file in $lockfiles) {
-  $fileTexts[$file] = Get-Content $file -Raw
+  $fileTexts[$file] = Get-Content -LiteralPath $file -Raw
 }
 
 Write-ProgressPercent 0
