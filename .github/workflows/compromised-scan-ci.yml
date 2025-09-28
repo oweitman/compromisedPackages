@@ -357,27 +357,27 @@ jobs:
                       throw "Did not find a 'Total: N match(es)' line in BAD output"
                   }
 
-                  - name: Run PowerShell scanner on GOOD (force local list)
-                  shell: pwsh
-                  run: |
-                      Copy-Item package-lock.good.json package-lock.json -Force
+            - name: Run PowerShell scanner on GOOD (force local list)
+              shell: pwsh
+              run: |
+                  Copy-Item package-lock.good.json package-lock.json -Force
 
-                      $out = & .\compromised.ps1 `
-                          -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
-                          *>&1
+                  $out = & .\compromised.ps1 `
+                      -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
+                      *>&1
 
-                      $text = [string]::Join("`n", $out)
-                      Set-Content -Path pwsh_good.txt -Value $text
+                  $text = [string]::Join("`n", $out)
+                  Set-Content -Path pwsh_good.txt -Value $text
 
-                      $m = [regex]::Match($text, 'Total:\s+([1-9]\d*)\s+match\(es\)')
-                      if ($m.Success) {
-                          Write-Host $text
-                          throw "Expected zero matches with GOOD fixture"
-                      }
-                      if ($text -notmatch 'No compromised packages found in lockfiles') {
-                          Write-Host $text
-                          throw "Expected the 'No compromised packages found in lockfiles' message in GOOD output"
-                      }
+                  $m = [regex]::Match($text, 'Total:\s+([1-9]\d*)\s+match\(es\)')
+                  if ($m.Success) {
+                      Write-Host $text
+                      throw "Expected zero matches with GOOD fixture"
+                  }
+                  if ($text -notmatch 'No compromised packages found in lockfiles') {
+                      Write-Host $text
+                      throw "Expected the 'No compromised packages found in lockfiles' message in GOOD output"
+                  }
 
             - name: Upload logs (Windows)
               uses: actions/upload-artifact@v4
