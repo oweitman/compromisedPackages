@@ -4,8 +4,6 @@ on:
     pull_request:
         paths:
             - 'compromised-packages.txt'
-            - 'scripts/generate-fixtures.sh'
-            - 'tests/fixtures/package-lock.*.json'
             - 'compromised.sh'
             - 'compromised.ps1'
     workflow_dispatch:
@@ -14,56 +12,109 @@ on:
                 description: 'Branch or tag to run against (optional)'
                 required: false
                 default: ''
+            entries:
+                description: 'How many list entries to include in fixtures (default 3)'
+                required: false
+                default: '3'
 
 permissions:
     contents: read
 
+env:
+    # Default number of packages used to build fixtures (can be overridden via workflow_dispatch.inputs.entries)
+    N: ${{ github.event.inputs.entries || '3' }}
+
 jobs:
-    validate-fixtures:
-        name: Validate fixtures vs list
+    linux-bash:
+        name: Bash scanner (Ubuntu)
         runs-on: ubuntu-latest
         steps:
             - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
+                  ref: ${{ github.event_name == 'pull_request'
+                      && github.event.pull_request.head.sha
+                      || (inputs.ref != '' && inputs.ref || github.sha) }}
 
-            - name: Regenerate fixtures (in-place)
+            - name: Make Bash scanner executable
+              run: chmod +x ./compromised.sh
+
+            - name: Generate fixtures from list (bad & good)
+              shell: bash
               run: |
                   set -euo pipefail
-                  chmod +x scripts/generate-fixtures.sh
-                  bash scripts/generate-fixtures.sh
-                  echo "If files changed below, fixtures were stale:"
-                  git status --porcelain=1 -- tests/fixtures || true
+                  LIST="compromised-packages.txt"
+                  [[ -f "$LIST" ]] || { echo "List not found: $LIST" >&2; exit 1; }
 
-            - name: Check fixtures up-to-date
-              run: |
-                  set -euo pipefail
-                  # Fail if generator modified committed fixtures
-                  if ! git diff --no-ext-diff --exit-code -- tests/fixtures/*.json; then
-                    echo "::error ::Fixtures are out of date. Run scripts/generate-fixtures.sh locally and commit the changes."
+                  N="${N:-3}"
+                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
+                  if (( ${#entries[@]} == 0 )); then
+                    echo "No non-comment entries in list; cannot build fixtures." >&2
                     exit 1
                   fi
 
-    linux-bash:
-        name: Bash scanner (Ubuntu)
-        needs: validate-fixtures
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
-              with:
-                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
+                  bump_ver() {
+                    local v="$1"
+                    if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
+                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
+                      echo "${major}.${minor}.$((patch+1000))${tail}"
+                    else
+                      echo "${v}.9999"
+                    fi
+                  }
 
-            - name: Ensure executable
-              run: chmod +x ./compromised.sh
+                  build_plock() {
+                    local outfile="$1" mode="$2" # mode=bad|good  (good bumps versions)
+                    {
+                      echo '{'
+                      echo '  "name": "fixture-test",'
+                      echo '  "version": "1.0.0",'
+                      echo '  "lockfileVersion": 2,'
+                      echo '  "requires": true,'
+
+                      echo '  "packages": {'
+                      echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+
+                      echo '  "dependencies": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+
+                      echo '  "flat_versions": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": "%s"' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  }'
+                      echo '}'
+                    } > "$outfile"
+                  }
+
+                  build_plock package-lock.bad.json  bad
+                  build_plock package-lock.good.json good
+
+                  echo "Built fixtures:"
+                  wc -c package-lock.bad.json package-lock.good.json
 
             - name: Test BAD fixture (should find >=1)
+              shell: bash
               run: |
                   set -euo pipefail
-                  cp tests/fixtures/package-lock.bad.json package-lock.json
+                  cp package-lock.bad.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_bad.txt
-                  # Expect an aggregated "Total: N match(es)" line with N>=1
                   total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || true)
                   echo "Bash BAD total=${total:-nil}"
                   if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
@@ -71,31 +122,92 @@ jobs:
                   fi
 
             - name: Test GOOD fixture (should find 0)
+              shell: bash
               run: |
                   set -euo pipefail
-                  cp tests/fixtures/package-lock.good.json package-lock.json
+                  cp package-lock.good.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_good.txt
                   if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
                     echo "Expected 0 matches on GOOD fixture"; echo "----- Output -----"; cat bash_good.txt; exit 1
                   fi
-                  # Also assert the OK line is present
                   grep -q 'No compromised packages found in lockfiles' bash_good.txt
 
     windows-pwsh:
         name: PowerShell scanner (Windows)
-        needs: validate-fixtures
         runs-on: windows-latest
         steps:
             - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
+                  ref: ${{ github.event_name == 'pull_request'
+                      && github.event.pull_request.head.sha
+                      || (inputs.ref != '' && inputs.ref || github.sha) }}
+
+            - name: Generate fixtures from list (bad & good)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  LIST="compromised-packages.txt"
+                  [[ -f "$LIST" ]] || { echo "List not found: $LIST" >&2; exit 1; }
+                  N="${N:-3}"
+                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
+                  if (( ${#entries[@]} == 0 )); then
+                    echo "No non-comment entries in list; cannot build fixtures." >&2
+                    exit 1
+                  fi
+                  bump_ver() {
+                    local v="$1"
+                    if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
+                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
+                      echo "${major}.${minor}.$((patch+1000))${tail}"
+                    else
+                      echo "${v}.9999"
+                    fi
+                  }
+                  build_plock() {
+                    local outfile="$1" mode="$2"
+                    {
+                      echo '{'
+                      echo '  "name": "fixture-test",'
+                      echo '  "version": "1.0.0",'
+                      echo '  "lockfileVersion": 2,'
+                      echo '  "requires": true,'
+                      echo '  "packages": {'
+                      echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+                      echo '  "dependencies": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+                      echo '  "flat_versions": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": "%s"' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  }'
+                      echo '}'
+                    } > "$outfile"
+                  }
+                  build_plock package-lock.bad.json  bad
+                  build_plock package-lock.good.json good
 
             - name: Test BAD fixture (should find >=1)
               shell: pwsh
               run: |
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-                  Copy-Item tests/fixtures/package-lock.bad.json -Destination package-lock.json -Force
+                  Copy-Item package-lock.bad.json -Destination package-lock.json -Force
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
                   $out | Tee-Object -FilePath pwsh_bad.txt
                   $text = ($out -join "`n")
@@ -108,7 +220,7 @@ jobs:
             - name: Test GOOD fixture (should find 0)
               shell: pwsh
               run: |
-                  Copy-Item tests/fixtures/package-lock.good.json -Destination package-lock.json -Force
+                  Copy-Item package-lock.good.json -Destination package-lock.json -Force
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
                   $out | Tee-Object -FilePath pwsh_good.txt
                   $text = ($out -join "`n")
