@@ -3,11 +3,11 @@ name: Compromised scanners CI
 # Run this workflow when a pull request modifies the compromised list
 # or when triggered manually via the workflow_dispatch input.
 on:
-    # Trigger when the compromised list is modified in a pull request.  Note: the
-    # file watched here is `compromised-packages.json` per the user's request.
+    # Trigger when the compromised list is modified in a pull request.  The
+    # repository stores this list as `compromised-packages.txt`, so watch that file.
     pull_request:
         paths:
-            - 'compromised-packages.json'
+            - 'compromised-packages.txt'
     # Allow the workflow to be started manually from the Actions tab.  Optional
     # inputs allow overriding the default branch or the number of entries used
     # when constructing test fixtures.
@@ -46,6 +46,13 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+                  # Use the JSON-formatted list for building fixtures.  Trim the
+                  # version string properly (strip leading/trailing whitespace and
+                  # retain only the first whitespace‑separated token) before
+                  # inserting into the lockfiles.  This avoids empty version
+                  # values when the list contains a space after the colon.
+                  # Use the text list from the repository.  Even though it's named
+                  # with a `.txt` extension, the format is the same (pkg: versions ...).
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
                   # Read the first N non-comment entries from the list
@@ -73,24 +80,31 @@ jobs:
                       echo '  "requires": true,'
                       echo '  "packages": {'
                       echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                  for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        # Trim leading/trailing spaces, then take the first token only
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
                       done
                       echo '  },'
                       echo '  "dependencies": {'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                  for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
                       done
                       echo '  },'
                       echo '  "flat_versions": {'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                  for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": "%s"' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -140,6 +154,13 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+                  # Use the JSON-formatted list for building fixtures.  Trim the
+                  # version string properly (strip leading/trailing whitespace and
+                  # retain only the first whitespace‑separated token) before
+                  # inserting into the lockfiles.  This avoids empty version
+                  # values when the list contains a space after the colon.
+                  # Use the text list from the repository.  Even though it's named
+                  # with a `.txt` extension, the format is the same (pkg: versions ...).
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
@@ -167,7 +188,10 @@ jobs:
                       echo '  "packages": {'
                       echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
                       for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        # Trim leading/trailing spaces, then take the first token only
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -175,7 +199,9 @@ jobs:
                       echo '  },'
                       echo '  "dependencies": {'
                       for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -183,7 +209,9 @@ jobs:
                       echo '  },'
                       echo '  "flat_versions": {'
                       for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
+                        ver="$(echo "$ver" | xargs)"
+                        ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": "%s"' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
