@@ -9,55 +9,51 @@ on:
             - 'compromised.sh'
             - 'compromised.ps1'
     workflow_dispatch:
+        inputs:
+            ref:
+                description: 'Branch or tag to run against (optional)'
+                required: false
+                default: ''
 
 permissions:
     contents: read
 
 jobs:
     validate-fixtures:
-        name: Validate fixtures vs current list
+        name: Validate fixtures vs list
         runs-on: ubuntu-latest
         steps:
-            - name: Checkout PR head
+            - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event.pull_request.head.sha }}
+                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
 
-            - name: Regenerate fixtures to tmp
+            - name: Regenerate fixtures (in-place)
               run: |
                   set -euo pipefail
-                  mkdir -p tmp-fixtures
-                  cp scripts/generate-fixtures.sh ./tmp-fixtures/
-                  bash ./tmp-fixtures/generate-fixtures.sh
-                  echo "--- DIFF bad.json ---"
-                  diff -u tests/fixtures/package-lock.bad.json tests/fixtures/package-lock.bad.json || true
-                  echo "--- DIFF good.json ---"
-                  diff -u tests/fixtures/package-lock.good.json tests/fixtures/package-lock.good.json || true
+                  chmod +x scripts/generate-fixtures.sh
+                  bash scripts/generate-fixtures.sh
+                  echo "If files changed below, fixtures were stale:"
+                  git status --porcelain=1 -- tests/fixtures || true
 
             - name: Check fixtures up-to-date
               run: |
                   set -euo pipefail
-                  bash scripts/generate-fixtures.sh
-                  if ! diff -u tests/fixtures/package-lock.bad.json tests/fixtures/package-lock.bad.json >/dev/null; then
-                    echo "Fixture package-lock.bad.json is outdated. Run scripts/generate-fixtures.sh and commit." >&2
+                  # Fail if generator modified committed fixtures
+                  if ! git diff --no-ext-diff --exit-code -- tests/fixtures/*.json; then
+                    echo "::error ::Fixtures are out of date. Run scripts/generate-fixtures.sh locally and commit the changes."
                     exit 1
                   fi
-                  if ! diff -u tests/fixtures/package-lock.good.json tests/fixtures/package-lock.good.json >/dev/null; then
-                    echo "Fixture package-lock.good.json is outdated. Run scripts/generate-fixtures.sh and commit." >&2
-                    exit 1
-                  fi
-        outputs:
-            ok: true
 
     linux-bash:
         name: Bash scanner (Ubuntu)
         needs: validate-fixtures
         runs-on: ubuntu-latest
         steps:
-            - name: Checkout PR head
+            - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event.pull_request.head.sha }}
+                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
 
             - name: Ensure executable
               run: chmod +x ./compromised.sh
@@ -67,9 +63,12 @@ jobs:
                   set -euo pipefail
                   cp tests/fixtures/package-lock.bad.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_bad.txt
-                  total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1)
+                  # Expect an aggregated "Total: N match(es)" line with N>=1
+                  total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || true)
                   echo "Bash BAD total=${total:-nil}"
-                  [[ -n "${total:-}" && "$total" -ge 1 ]]
+                  if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
+                    echo "Expected >=1 match on BAD fixture"; echo "----- Output -----"; cat bash_bad.txt; exit 1
+                  fi
 
             - name: Test GOOD fixture (should find 0)
               run: |
@@ -77,18 +76,20 @@ jobs:
                   cp tests/fixtures/package-lock.good.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_good.txt
                   if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
-                    echo "Expected 0 matches on GOOD fixture"; exit 1
+                    echo "Expected 0 matches on GOOD fixture"; echo "----- Output -----"; cat bash_good.txt; exit 1
                   fi
+                  # Also assert the OK line is present
+                  grep -q 'No compromised packages found in lockfiles' bash_good.txt
 
     windows-pwsh:
         name: PowerShell scanner (Windows)
         needs: validate-fixtures
         runs-on: windows-latest
         steps:
-            - name: Checkout PR head
+            - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event.pull_request.head.sha }}
+                  ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || (inputs.ref != '' && inputs.ref || github.ref) }}
 
             - name: Test BAD fixture (should find >=1)
               shell: pwsh
@@ -97,10 +98,11 @@ jobs:
                   Copy-Item tests/fixtures/package-lock.bad.json -Destination package-lock.json -Force
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
                   $out | Tee-Object -FilePath pwsh_bad.txt
-                  $m = [regex]::Match(($out -join "`n"), 'Total:\s+(\d+)\s+match\(es\)')
+                  $text = ($out -join "`n")
+                  $m = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
                   if (-not $m.Success -or [int]$m.Groups[1].Value -lt 1) {
-                    Write-Host ($out -join "`n")
-                    throw "Expected >=1 matches on BAD fixture"
+                    Write-Host $text
+                    throw "Expected >=1 match on BAD fixture"
                   }
 
             - name: Test GOOD fixture (should find 0)
@@ -109,7 +111,12 @@ jobs:
                   Copy-Item tests/fixtures/package-lock.good.json -Destination package-lock.json -Force
                   $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
                   $out | Tee-Object -FilePath pwsh_good.txt
-                  if (($out -join "`n") -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
-                    Write-Host ($out -join "`n")
+                  $text = ($out -join "`n")
+                  if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
+                    Write-Host $text
                     throw "Expected 0 matches on GOOD fixture"
+                  }
+                  if ($text -notmatch 'No compromised packages found in lockfiles') {
+                    Write-Host $text
+                    throw "Expected OK line on GOOD fixture"
                   }
