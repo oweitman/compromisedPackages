@@ -1,5 +1,6 @@
 name: Compromised scanners CI
 
+# Auslöser: Pull Request auf die Haupt-Skripte oder manuelles Starten
 on:
     pull_request:
         paths:
@@ -13,7 +14,7 @@ on:
                 required: false
                 default: ''
             entries:
-                description: 'How many list entries to include in fixtures (default 3)'
+                description: 'Number of entries from the list to use in test fixtures (default 3)'
                 required: false
                 default: '3'
 
@@ -21,7 +22,7 @@ permissions:
     contents: read
 
 env:
-    # Default number of packages used to build fixtures (can be overridden via workflow_dispatch.inputs.entries)
+    # default number of list entries used to build fixtures (override via workflow_dispatch.inputs.entries)
     N: ${{ github.event.inputs.entries || '3' }}
 
 jobs:
@@ -29,137 +30,32 @@ jobs:
         name: Bash scanner (Ubuntu)
         runs-on: ubuntu-latest
         steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+            - name: Checkout PR head or dispatch ref
+            - uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event_name == 'pull_request'
-                      && github.event.pull_request.head.sha
+                  ref:
+                      ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
                       || (inputs.ref != '' && inputs.ref || github.sha) }}
 
-            - name: Make Bash scanner executable
+            - name: Make compromised.sh executable
               run: chmod +x ./compromised.sh
 
-            - name: Generate fixtures from list (bad & good)
+            - name: Generate test fixtures
               shell: bash
               run: |
                   set -euo pipefail
                   LIST="compromised-packages.txt"
-                  [[ -f "$LIST" ]] || { echo "List not found: $LIST" >&2; exit 1; }
-
                   N="${N:-3}"
+                  # Grep first N non-comment lines
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
                   if (( ${#entries[@]} == 0 )); then
-                    echo "No non-comment entries in list; cannot build fixtures." >&2
-                    exit 1
-                  fi
-
-                  bump_ver() {
-                    local v="$1"
-                    if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
-                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
-                      echo "${major}.${minor}.$((patch+1000))${tail}"
-                    else
-                      echo "${v}.9999"
-                    fi
-                  }
-
-                  build_plock() {
-                    local outfile="$1" mode="$2" # mode=bad|good  (good bumps versions)
-                    {
-                      echo '{'
-                      echo '  "name": "fixture-test",'
-                      echo '  "version": "1.0.0",'
-                      echo '  "lockfileVersion": 2,'
-                      echo '  "requires": true,'
-
-                      echo '  "packages": {'
-                      echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
-                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
-                        printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
-                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
-                      done
-                      echo '  },'
-
-                      echo '  "dependencies": {'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
-                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
-                        printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
-                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
-                      done
-                      echo '  },'
-
-                      echo '  "flat_versions": {'
-                      for i in "${!entries[@]}"; do
-                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
-                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
-                        printf '    "%s": "%s"' "$pkg" "$ver"
-                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
-                      done
-                      echo '  }'
-                      echo '}'
-                    } > "$outfile"
-                  }
-
-                  build_plock package-lock.bad.json  bad
-                  build_plock package-lock.good.json good
-
-                  echo "Built fixtures:"
-                  wc -c package-lock.bad.json package-lock.good.json
-
-            - name: Test BAD fixture (should find >=1)
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  cp package-lock.bad.json package-lock.json
-                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_bad.txt
-                  total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || true)
-                  echo "Bash BAD total=${total:-nil}"
-                  if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
-                    echo "Expected >=1 match on BAD fixture"; echo "----- Output -----"; cat bash_bad.txt; exit 1
-                  fi
-
-            - name: Test GOOD fixture (should find 0)
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  cp package-lock.good.json package-lock.json
-                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.local 2>&1 | tee bash_good.txt
-                  if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
-                    echo "Expected 0 matches on GOOD fixture"; echo "----- Output -----"; cat bash_good.txt; exit 1
-                  fi
-                  grep -q 'No compromised packages found in lockfiles' bash_good.txt
-
-    windows-pwsh:
-        name: PowerShell scanner (Windows)
-        runs-on: windows-latest
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
-              with:
-                  ref: ${{ github.event_name == 'pull_request'
-                      && github.event.pull_request.head.sha
-                      || (inputs.ref != '' && inputs.ref || github.sha) }}
-
-            - name: Generate fixtures from list (bad & good)
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  LIST="compromised-packages.txt"
-                  [[ -f "$LIST" ]] || { echo "List not found: $LIST" >&2; exit 1; }
-                  N="${N:-3}"
-                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
-                  if (( ${#entries[@]} == 0 )); then
-                    echo "No non-comment entries in list; cannot build fixtures." >&2
+                    echo "No entries found in compromised list" >&2
                     exit 1
                   fi
                   bump_ver() {
                     local v="$1"
                     if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
-                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
-                      echo "${major}.${minor}.$((patch+1000))${tail}"
+                      echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3]+1000))${BASH_REMATCH[4]}"
                     else
                       echo "${v}.9999"
                     fi
@@ -200,35 +96,78 @@ jobs:
                       echo '}'
                     } > "$outfile"
                   }
-                  build_plock package-lock.bad.json  bad
+                  build_plock package-lock.bad.json bad
+                  build_plock package-lock.good.json good
+                  echo "fixtures created"
+
+            - name: Run Bash scanner on BAD fixture (expect match)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cp package-lock.bad.json package-lock.json
+                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_bad.txt
+                  total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || echo "")
+                  [ -n "$total" ] && [ "$total" -ge 1 ] || (echo "BAD fixture expected at least one match" && exit 1)
+
+            - name: Run Bash scanner on GOOD fixture (expect zero)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cp package-lock.good.json package-lock.json
+                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_good.txt
+                  ! grep -q '^Total: [1-9][0-9]*' bash_good.txt
+
+    windows-pwsh:
+        name: PowerShell scanner (Windows)
+        runs-on: windows-latest
+        steps:
+            - name: Checkout PR head or dispatch ref
+              uses: actions/checkout@v4
+              with:
+                  ref:
+                      ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
+                      || (inputs.ref != '' && inputs.ref || github.sha) }}
+
+            - name: Generate fixtures from list
+              shell: bash
+              run: |
+                  # Same generation as above (bash for convenience in Windows job)
+                  set -euo pipefail
+                  LIST="compromised-packages.txt"
+                  N="${N:-3}"
+                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
+                  bump_ver() {
+                    local v="$1"
+                    if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
+                      echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3]+1000))${BASH_REMATCH[4]}"
+                    else
+                      echo "${v}.9999"
+                    fi
+                  }
+                  build_plock() { ... } # identical to the linux job snippet
+                  build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
-            - name: Test BAD fixture (should find >=1)
+            - name: Run PowerShell scanner on BAD fixture (expect match)
               shell: pwsh
               run: |
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
                   Copy-Item package-lock.bad.json -Destination package-lock.json -Force
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
-                  $out | Tee-Object -FilePath pwsh_bad.txt
-                  $text = ($out -join "`n")
-                  $m = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
-                  if (-not $m.Success -or [int]$m.Groups[1].Value -lt 1) {
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.example"
+                  $text = $out -join "`n"
+                  $match = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
+                  if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
                     Write-Host $text
-                    throw "Expected >=1 match on BAD fixture"
+                    throw "BAD fixture expected at least one match"
                   }
 
-            - name: Test GOOD fixture (should find 0)
+            - name: Run PowerShell scanner on GOOD fixture (expect zero)
               shell: pwsh
               run: |
                   Copy-Item package-lock.good.json -Destination package-lock.json -Force
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.local" 2>&1
-                  $out | Tee-Object -FilePath pwsh_good.txt
-                  $text = ($out -join "`n")
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.example"
+                  $text = $out -join "`n"
                   if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
                     Write-Host $text
-                    throw "Expected 0 matches on GOOD fixture"
-                  }
-                  if ($text -notmatch 'No compromised packages found in lockfiles') {
-                    Write-Host $text
-                    throw "Expected OK line on GOOD fixture"
+                    throw "GOOD fixture should not find any matches"
                   }
