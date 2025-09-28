@@ -1,149 +1,288 @@
-# compromised-singleurl-debug.ps1
-# Requires -Version 5.1
+#Requires -Version 5.1
 <#
-  Single-URL compromised package scanner with debug output
-  - Uses one URL (set in $ListUrl)
-  - Detects HTML responses and rejects them
-  - Caches downloaded list to %TEMP%\compromised-packages.txt
-  - Shows progress via Write-Progress while scanning lockfiles
-  - When $ShowContent is $true prints the downloaded file (first N lines)
+  compromised.ps1
+  Scans ONLY the current directory for lockfiles and reports compromised packages.
+
+  Parameters:
+    -ListUrl     : URL of the compromised package list
+    -Cache       : optional cache file path for the list
+    -ShowContent : switch to print first lines of the list
+    -ShowLines   : number of lines to print with -ShowContent (default 200)
 #>
+
+[CmdletBinding()]
+param(
+  [string]$ListUrl = 'https://raw.githubusercontent.com/oweitman/compromisedPackages/main/compromised-packages.txt',
+  [string]$Cache,
+  [switch]$ShowContent,
+  [int]$ShowLines = 200
+)
 
 $ErrorActionPreference = 'Stop'
 
-# === Konfiguration ===
-# Use jsDelivr (CDN) to avoid raw.githubusercontent redirect issues, or set your working raw URL here.
-$ListUrl = 'https://cdn.jsdelivr.net/gh/oweitman/compromisedPackages@main/compromised-packages.txt'
-$Cache = Join-Path $env:TEMP 'compromised-packages.txt'
+# ---------------- Helpers ----------------
 
-# Debug: set to $true to print the downloaded file (first $ShowLines lines)
-$ShowContent = $true
-$ShowLines = 200
-
-Write-Host ""
-Write-Host "Lade Kompromittiertenliste von: $ListUrl" -ForegroundColor Cyan
-
-# === Download (single URL) ===
-$downloaded = $false
-try {
-    Invoke-WebRequest -Uri $ListUrl -UseBasicParsing -OutFile "$Cache.tmp" -ErrorAction Stop
-    # Quick sanity-check: read first few lines to detect HTML pages
-    $firstLines = Get-Content "$Cache.tmp" -TotalCount 6
-    $firstText = ($firstLines -join "`n")
-    if ($firstText -match '<!doctype|<html|<head') {
-        Write-Warning "Downloaded content looks like HTML (redirect/login/preview page). Will not use it."
-        Remove-Item "$Cache.tmp" -ErrorAction SilentlyContinue
-        $downloaded = $false
-    } else {
-        Move-Item -Force "$Cache.tmp" $Cache
-        Write-Host "Liste erfolgreich heruntergeladen und zwischengespeichert: $Cache"
-        $downloaded = $true
-    }
-} catch {
-    Write-Warning "Download failed from $ListUrl : $($_.Exception.Message)"
-    if (Test-Path "$Cache.tmp") { Remove-Item "$Cache.tmp" -ErrorAction SilentlyContinue }
-    $downloaded = $false
+function Write-ProgressPercent {
+  param([int]$Percent)
+  if ($Percent -lt 0) { $Percent = 0 }
+  if ($Percent -gt 100) { $Percent = 100 }
+  Write-Progress -Activity "[Progress]" -Status ("{0}% complete" -f $Percent) -PercentComplete $Percent
 }
 
-if (-not $downloaded) {
-    if (Test-Path $Cache) {
-        Write-Warning "Verwende lokale Cache-Datei: $Cache"
-    } else {
-        Write-Error "Konnte die Liste nicht laden und kein Cache gefunden. Abbruch."
-        exit 2
-    }
+function Test-IsHtmlPreview {
+  param([string[]]$HeadLines)
+  $joined = ($HeadLines -join "`n")
+  return ($joined -match '<!doctype|<html|<head')
 }
 
-# Optionally print the file for debugging
-<# if ($ShowContent) {
-    Write-Host "`n--- Inhalt der genutzten Datei (erste $ShowLines Zeilen) ---`n"
-    Get-Content $Cache | Select-Object -First $ShowLines | ForEach-Object { Write-Host "  $_" }
-    Write-Host "`n--- Ende (gegebenenfalls nur Kopf der Datei gezeigt) ---`n"
-} #>
+function Get-ListLines {
+  param(
+    [string]$Url,
+    [string]$CacheFile
+  )
+  Write-Host ("Downloading compromised package list from: {0}" -f $Url)
 
-# === Parsen in Hashtable: $compromised["pkg"] = @("v1","v2",...) ===
-$raw = Get-Content $Cache -Raw
-$compromised = @{}
-$raw -split "`n" | ForEach-Object {
-    $line = $_.Trim()
-    if (-not $line -or $line.StartsWith('#')) { return }
+  $lines = $null
+
+  if ($CacheFile) {
+    $tmp = "$CacheFile.tmp"
+    try {
+      Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $tmp
+      $head = Get-Content $tmp -TotalCount 6
+      if (Test-IsHtmlPreview $head) {
+        Write-Warning "Download looks like HTML/Preview."
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+        if (Test-Path $CacheFile) {
+          $lines = Get-Content $CacheFile -ErrorAction Stop
+          Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
+        } else {
+          throw "No valid content and no cache available."
+        }
+      } else {
+        Move-Item -Force $tmp $CacheFile
+        $lines = Get-Content $CacheFile -ErrorAction Stop
+        Write-Host ("List successfully downloaded and cached at: {0}" -f $CacheFile)
+      }
+    } catch {
+      if (Test-Path $tmp) { Remove-Item $tmp -ErrorAction SilentlyContinue }
+      if (-not $lines) {
+        if (Test-Path $CacheFile) {
+          try {
+            $lines = Get-Content $CacheFile -ErrorAction Stop
+            Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
+          } catch {
+            throw "Failed to load list from URL and cache."
+          }
+        } else {
+          throw ("Failed to load list: {0}" -f $Url)
+        }
+      }
+    }
+  } else {
+    try {
+      $tmp = New-TemporaryFile
+      Invoke-WebRequest -Uri $Url -UseBasicParsing -OutFile $tmp
+      $head = Get-Content $tmp -TotalCount 6
+      if (Test-IsHtmlPreview $head) {
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+        throw "Download looks like HTML/Preview. Aborting."
+      }
+      $lines = Get-Content $tmp -ErrorAction Stop
+      Remove-Item $tmp -ErrorAction SilentlyContinue
+    } catch {
+      if ($tmp) { Remove-Item $tmp -ErrorAction SilentlyContinue }
+      throw
+    }
+  }
+
+  if ($ShowContent) {
+    Write-Host ""
+    Write-Host ("--- First {0} lines of the list ---" -f $ShowLines)
+    ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }
+    Write-Host "--- End ---`n"
+  }
+
+  return $lines
+}
+
+function Parse-CompromisedList {
+  param([string[]]$Lines)
+  $dict = @{}
+  $nonComment = 0
+  foreach ($raw in $Lines) {
+    $line = $raw.Trim()
+    if (-not $line) { continue }
+    if ($line.StartsWith('#')) { continue }
+    $nonComment++
+
     $idx = $line.IndexOf(':')
-    if ($idx -lt 0) { return }
+    if ($idx -lt 0) { continue }
     $pkg = $line.Substring(0, $idx).Trim()
-    $vers = $line.Substring($idx + 1).Trim() -split '\s+'
-    if ($pkg -and $vers.Count -gt 0) {
-        $compromised[$pkg] = $vers
+    $versPart = $line.Substring($idx + 1).Trim()
+    if (-not $pkg -or -not $versPart) { continue }
+
+    $versions = $versPart -split '\s+' | Where-Object { $_ -ne '' }
+    if ($versions.Count -gt 0) {
+      $dict[$pkg] = $versions
     }
+  }
+  Write-Host ("Info: {0} non-comment lines; {1} package(s) parsed." -f $nonComment, $dict.Keys.Count)
+  return $dict
 }
 
+function Get-LockfilesCurrentDir {
+  $files = @()
+  foreach ($name in @('package-lock.json','yarn.lock','pnpm-lock.yaml')) {
+    $p = Join-Path (Get-Location) $name
+    if (Test-Path $p) { $files += $p }
+  }
+  return $files
+}
+
+# Escape for regex literal
+function Escape-Regex([string]$s) {
+  return [regex]::Escape($s)
+}
+
+# (A) Flat key:   "pkg" : "ver"   (line-based)
+function Test-FlatJsonMatch {
+  param([string]$Text, [string]$Pkg, [string]$Ver)
+  $pkgRe = Escape-Regex $Pkg
+  $verRe = Escape-Regex $Ver
+  $pattern = ('"{0}"\s*:\s*"{1}"(?:\s*,|\s*)$' -f $pkgRe, $verRe)
+  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+}
+
+# (B) dependencies block: "pkg": { ... "version": "ver" ... }  (multi-line)
+function Test-DependenciesBlock {
+  param([string]$Text, [string]$Pkg, [string]$Ver)
+  $pkgRe = Escape-Regex $Pkg
+  $verRe = Escape-Regex $Ver
+  # Use Singleline to span across newlines; double braces to emit literal { } in format string
+  $pattern = ('"{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe)
+  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+}
+
+# (C) packages block: "node_modules/pkg": { ... "version": "ver" ... }  (multi-line)
+function Test-PackagesBlock {
+  param([string]$Text, [string]$Pkg, [string]$Ver)
+  $pkgRe = Escape-Regex $Pkg
+  $verRe = Escape-Regex $Ver
+  $pattern = ('"node_modules/{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe)
+  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+}
+
+# (D) yarn header:  ^pkg@(^|~)?ver(:|\b)
+function Test-YarnHeader {
+  param([string]$Text, [string]$Pkg, [string]$Ver)
+  $pkgRe = Escape-Regex $Pkg
+  $verRe = Escape-Regex $Ver
+  $pattern = ('^{0}@(\^|~)?{1}(:|\b)' -f $pkgRe, $verRe)
+  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+}
+
+# ---------------- Main flow ----------------
+
+# 1) Load list
+$listLines = Get-ListLines -Url $ListUrl -CacheFile $Cache
+
+# 2) Parse list
+$compromised = Parse-CompromisedList -Lines $listLines
 if ($compromised.Keys.Count -eq 0) {
-    Write-Warning "Keine Pakete aus der Liste geparst. Bitte überprüfe die Datei: $Cache"
-    exit 1
+  Write-Host "Nothing to check (empty list)."
+  exit 0
 }
 
-Write-Host ""
-Write-Host 'Searching for compromised NPM packages in lockfiles...' -ForegroundColor Cyan
-
-# Lockfiles suchen
-$lockfiles = Get-ChildItem -Recurse -File | Where-Object {
-    $_.Name -in @('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml')
+# 3) Lockfiles in current dir
+Write-Host ("Scanning lockfiles in: {0} (current directory only)..." -f (Get-Location).Path)
+$lockfiles = Get-LockfilesCurrentDir
+Write-Host ("Info: {0} lockfile(s) found." -f $lockfiles.Count)
+foreach ($f in $lockfiles) {
+  try { $len = (Get-Item $f).Length } catch { $len = 0 }
+  Write-Host (" - {0} ({1} bytes)" -f $f, $len)
 }
-if (-not $lockfiles) {
-    Write-Host "No lockfiles found in $(Get-Location)." -ForegroundColor Yellow
-    exit 0
+if ($lockfiles.Count -eq 0) { Write-Host "No lockfiles found."; exit 0 }
+
+# 4) Workload
+$totalVersions = 0
+foreach ($pkg in $compromised.Keys) { $totalVersions += ($compromised[$pkg]).Count }
+$totalChecks = $totalVersions * $lockfiles.Count
+if ($totalChecks -le 0) {
+  Write-Host ("Nothing to check. (total_versions={0}, lockfiles={1})" -f $totalVersions, $lockfiles.Count)
+  exit 0
 }
 
-# -------- Pattern vorbereiten --------
-$patterns = New-Object System.Collections.Generic.List[string]
-foreach ($pkg in $compromised.Keys) {
-    foreach ($ver in $compromised[$pkg]) {
-        $pkgEsc = [regex]::Escape($pkg)
-        $verEsc = [regex]::Escape($ver)
-        # JSON form: "pkg": "....ver...."
-        $patterns.Add('"' + $pkgEsc + '"\s*:\s*".*' + $verEsc + '"')
-        # yarn.lock form: ^pkg@ver\b
-        $patterns.Add('^' + $pkgEsc + '@' + $verEsc + '\b')
-    }
-}
-$bigPattern = ($patterns -join "|")
+# 5) Scan (dedup + aggregation)
+$hitMap = New-Object 'System.Collections.Generic.HashSet[string]'
+$perFileCounts = @{}
+$done = 0
+$lastShown = -1
 
-# Progress vars
-$totalFiles   = $lockfiles.Count
-$currentFile  = 0
-$lastProgress = -1
-$found = $false
+# Cache file contents for faster matching
+$fileTexts = @{}
+foreach ($file in $lockfiles) {
+  $fileTexts[$file] = Get-Content $file -Raw
+}
+
+Write-ProgressPercent 0
 
 foreach ($file in $lockfiles) {
-    $currentFile++
-    $percent = [math]::Floor(($currentFile / $totalFiles) * 100)
-    if ($percent -ge $lastProgress + 1 -and $percent -le 100) {
-        Write-Progress -Activity "Checking lockfiles for compromised packages..." `
-                       -Status "$percent% completed" `
-                       -PercentComplete $percent
-        $lastProgress = $percent
-    }
+  $text = $fileTexts[$file]
 
-    $matches = Select-String -Path $file.FullName -Pattern $bigPattern -AllMatches
-    if ($matches) {
-        Write-Host ""
-        Write-Host "[!] Found in: $($file.FullName)" -ForegroundColor Red
-        foreach ($m in $matches) {
-            Write-Host $m.Line -ForegroundColor Yellow
-        }
-        $found = $true
-    } else {
-        Write-Host "No matches in $($file.Name)"
+  foreach ($pkg in $compromised.Keys) {
+    $versions = $compromised[$pkg]
+    foreach ($ver in $versions) {
+      $done++
+      $percent = [int][Math]::Floor(($done / $totalChecks) * 100)
+      if ($percent -gt $lastShown) { Write-ProgressPercent $percent; $lastShown = $percent }
+
+      $key = ("{0}|{1}@{2}" -f $file, $pkg, $ver)
+      if ($hitMap.Contains($key)) { continue }
+
+      $hit = $false
+      if (-not $hit) { $hit = Test-FlatJsonMatch     -Text $text -Pkg $pkg -Ver $ver }
+      if (-not $hit) { $hit = Test-DependenciesBlock -Text $text -Pkg $pkg -Ver $ver }
+      if (-not $hit) { $hit = Test-PackagesBlock     -Text $text -Pkg $pkg -Ver $ver }
+      if (-not $hit) { $hit = Test-YarnHeader        -Text $text -Pkg $pkg -Ver $ver }
+
+      if ($hit) {
+        $null = $hitMap.Add($key)
+        if (-not $perFileCounts.ContainsKey($file)) { $perFileCounts[$file] = 0 }
+        $perFileCounts[$file]++
+      }
     }
+  }
 }
 
-Write-Progress -Activity "Checking lockfiles for compromised packages..." -Status "100% completed" -PercentComplete 100
+Write-ProgressPercent 100
 
-if (-not $found) {
-    Write-Host ""
-    Write-Host 'No compromised packages found in lockfiles.' -ForegroundColor Green
-} else {
-    Write-Host ""
-    Write-Host 'Please remove the affected packages and regenerate the lockfiles!' -ForegroundColor Magenta
+# 6) Aggregated output
+if ($hitMap.Count -eq 0) {
+  Write-Host "OK: No compromised packages found in lockfiles."
+  exit 0
 }
 
-# End of script
+Write-Host ""
+Write-Host "Results (aggregated):"
+$totalHits = 0
+foreach ($f in $lockfiles) {
+  $count = 0
+  if ($perFileCounts.ContainsKey($f)) { $count = $perFileCounts[$f] }
+  if ($count -le 0) { continue }
+  Write-Host ("- {0}  --  {1} match(es)" -f $f, $count)
+
+  $hitsForFile =
+    $hitMap |
+    Where-Object { $_.StartsWith("$f|") } |
+    Sort-Object
+
+  foreach ($kv in $hitsForFile) {
+    $pkgver = $kv.Substring($f.Length + 1)
+    Write-Host ("   * {0}" -f $pkgver)
+    $totalHits++
+  }
+}
+
+Write-Host ""
+Write-Host ("Total: {0} match(es) in {1} file(s)." -f $totalHits, $lockfiles.Count)
+Write-Host "Action: Please update/remove the affected packages and regenerate your lockfiles."
