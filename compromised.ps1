@@ -25,114 +25,61 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Platform detection (portable)
-$IsWindows = $false
+# Platform detection (portable) — do NOT overwrite automatic $IsWindows; use a local var
+$IsWindowsLocal = $false
 try {
-  if ($env:OS -eq 'Windows_NT') { $IsWindows = $true }
-} catch { $IsWindows = $false }
+  if (Get-Variable -Name IsWindows -Scope 0 -ErrorAction SilentlyContinue) {
+    $IsWindowsLocal = $IsWindows
+  }
+  elseif ($env:OS -eq 'Windows_NT') {
+    $IsWindowsLocal = $true
+  }
+} catch {
+  $IsWindowsLocal = ($env:OS -eq 'Windows_NT')
+}
 
-# ---------------- Helpers ----------------
-
-function Write-ProgressPercent {
-  param([int]$Percent)
+function Write-ProgressPercent { param([int]$Percent)
   if ($Percent -lt 0) { $Percent = 0 }
   if ($Percent -gt 100) { $Percent = 100 }
   Write-Progress -Activity "[Progress]" -Status ("{0}% complete" -f $Percent) -PercentComplete $Percent
 }
 
-function Test-IsHtmlPreview {
-  param([string[]]$HeadLines)
+function Test-IsHtmlPreview { param([string[]]$HeadLines)
   $joined = ($HeadLines -join "`n")
   return ($joined -match '<!doctype|<html|<head')
 }
 
-# normalize a file:// URL to a local path
-function Convert-FileUrlToLocalPath {
-  param([string]$Url)
-  # strip scheme (case-insensitive)
+function Convert-FileUrlToLocalPath { param([string]$Url)
   $local = $Url -replace '^(?i)file:///?', ''
-  try {
-    $local = [System.Uri]::UnescapeDataString($local)
-  } catch { }
-  if ($IsWindows) { $local = $local -replace '/', '\' }
+  try { $local = [System.Uri]::UnescapeDataString($local) } catch {}
+  if ($IsWindowsLocal) { $local = $local -replace '/', '\' }
   return $local
 }
 
-function Get-ListLines {
-  param(
-    [string]$Url,
-    [string]$CacheFile
-  )
-
+function Get-ListLines { param([string]$Url, [string]$CacheFile)
   Write-Host ("Downloading compromised package list from: {0}" -f $Url)
-
-  # Special-case file:// URIs: read directly or copy into cache
   if ($Url -match '^(?i)file:///?') {
     $localPath = Convert-FileUrlToLocalPath -Url $Url
-    if (-not (Test-Path -LiteralPath $localPath)) {
-      throw "Local list file not found: $localPath"
-    }
-
-    if ($CacheFile) {
-      try {
-        Copy-Item -LiteralPath $localPath -Destination $CacheFile -Force
-        Write-Host ("List copied from local file to cache at: {0}" -f $CacheFile)
-        $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
-      } catch {
-        throw "Failed to copy local list to cache: $_"
-      }
-    } else {
-      try {
-        $lines = Get-Content -LiteralPath $localPath -ErrorAction Stop
-      } catch {
-        throw "Failed to read local list file: $_"
-      }
-    }
-
-    if ($ShowContent) {
-      Write-Host ""
-      Write-Host ("--- First {0} lines of the list ---" -f $ShowLines)
-      ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }
-      Write-Host "--- End ---`n"
-    }
-
+    if (-not (Test-Path -LiteralPath $localPath)) { throw "Local list file not found: $localPath" }
+    if ($CacheFile) { Copy-Item -LiteralPath $localPath -Destination $CacheFile -Force; $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop }
+    else { $lines = Get-Content -LiteralPath $localPath -ErrorAction Stop }
+    if ($ShowContent) { Write-Host ""; Write-Host ("--- First {0} lines of the list ---" -f $ShowLines); ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }; Write-Host "--- End ---`n" }
     return $lines
   }
 
-  # HTTP(S) handling (with optional cache)
   $lines = $null
   if ($CacheFile) {
     $tmp = "$CacheFile.tmp"
     try {
       Invoke-WebRequest -Uri $Url -OutFile $tmp -ErrorAction Stop
       $head = Get-Content -LiteralPath $tmp -TotalCount 6 -ErrorAction Stop
-      if (Test-IsHtmlPreview $head) {
-        Write-Warning "Download looks like HTML/Preview."
-        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
-        if (Test-Path $CacheFile) {
-          $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
-          Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
-        } else {
-          throw "No valid content and no cache available."
-        }
-      } else {
-        Move-Item -Force -LiteralPath $tmp -Destination $CacheFile
-        $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
-        Write-Host ("List successfully downloaded and cached at: {0}" -f $CacheFile)
-      }
+      if (Test-IsHtmlPreview $head) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; if (Test-Path $CacheFile) { $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop } else { throw "No valid content and no cache available." } }
+      else { Move-Item -Force -LiteralPath $tmp -Destination $CacheFile; $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop; Write-Host ("List successfully downloaded and cached at: {0}" -f $CacheFile) }
     } catch {
       if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
       if (-not $lines) {
-        if (Test-Path $CacheFile) {
-          try {
-            $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop
-            Write-Warning ("Using existing cache file: {0}" -f $CacheFile)
-          } catch {
-            throw "Failed to load list from URL and cache."
-          }
-        } else {
-          throw ("Failed to load list: {0}" -f $Url)
-        }
+        if (Test-Path $CacheFile) { $lines = Get-Content -LiteralPath $CacheFile -ErrorAction Stop }
+        else { throw ("Failed to load list: {0}" -f $Url) }
       }
     }
   } else {
@@ -140,10 +87,7 @@ function Get-ListLines {
     try {
       Invoke-WebRequest -Uri $Url -OutFile $tmp -ErrorAction Stop
       $head = Get-Content -LiteralPath $tmp -TotalCount 6 -ErrorAction Stop
-      if (Test-IsHtmlPreview $head) {
-        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
-        throw "Download looks like HTML/Preview. Aborting."
-      }
+      if (Test-IsHtmlPreview $head) { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue; throw "Download looks like HTML/Preview. Aborting." }
       $lines = Get-Content -LiteralPath $tmp -ErrorAction Stop
       Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
     } catch {
@@ -152,37 +96,21 @@ function Get-ListLines {
     }
   }
 
-  if ($ShowContent) {
-    Write-Host ""
-    Write-Host ("--- First {0} lines of the list ---" -f $ShowLines)
-    ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }
-    Write-Host "--- End ---`n"
-  }
-
+  if ($ShowContent) { Write-Host ""; Write-Host ("--- First {0} lines of the list ---" -f $ShowLines); ($lines | Select-Object -First $ShowLines) | ForEach-Object { Write-Host $_ }; Write-Host "--- End ---`n" }
   return $lines
 }
 
-function Parse-CompromisedList {
-  param([string[]]$Lines)
-  $dict = @{}
-  $nonComment = 0
+function Parse-CompromisedList { param([string[]]$Lines)
+  $dict = @{}; $nonComment = 0
   foreach ($raw in $Lines) {
-    $line = $raw.Trim()
-    if (-not $line) { continue }
+    $line = $raw.Trim(); if (-not $line) { continue }
     if ($line.StartsWith('#')) { continue }
     $nonComment++
-
-    $idx = $line.IndexOf(':')
-    if ($idx -lt 0) { continue }
-    $pkg = $line.Substring(0, $idx).Trim()
-    $versPart = $line.Substring($idx + 1).Trim()
+    $idx = $line.IndexOf(':'); if ($idx -lt 0) { continue }
+    $pkg = $line.Substring(0, $idx).Trim(); $versPart = $line.Substring($idx + 1).Trim()
     if (-not $pkg -or -not $versPart) { continue }
-
-    # split on whitespace (regex) — use single backslash in source
     $versions = $versPart -split '\s+' | Where-Object { $_ -ne '' }
-    if ($versions.Count -gt 0) {
-      $dict[$pkg] = $versions
-    }
+    if ($versions.Count -gt 0) { $dict[$pkg] = $versions }
   }
   Write-Host ("Info: {0} non-comment lines; {1} package(s) parsed." -f $nonComment, $dict.Keys.Count)
   return $dict
@@ -190,41 +118,15 @@ function Parse-CompromisedList {
 
 function Get-LockfilesCurrentDir {
   $files = @()
-  foreach ($name in @('package-lock.json','yarn.lock','pnpm-lock.yaml')) {
-    $p = Join-Path (Get-Location) $name
-    if (Test-Path $p) { $files += $p }
-  }
+  foreach ($name in @('package-lock.json','yarn.lock','pnpm-lock.yaml')) { $p = Join-Path (Get-Location) $name; if (Test-Path $p) { $files += $p } }
   return $files
 }
 
 function Escape-Regex([string]$s) { return [regex]::Escape($s) }
-
-function Test-FlatJsonMatch { param([string]$Text,[string]$Pkg,[string]$Ver)
-  $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver
-  # simpler, tolerant pattern (no brittle line-end anchoring)
-  $pattern = ('"{0}"\s*:\s*"{1}"' -f $pkgRe, $verRe)
-  return [regex]::IsMatch($Text, $pattern)
-}
-
-function Test-DependenciesBlock { param([string]$Text,[string]$Pkg,[string]$Ver)
-  $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver
-  $pattern = ('"{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe)
-  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
-}
-
-function Test-PackagesBlock { param([string]$Text,[string]$Pkg,[string]$Ver)
-  $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver
-  $pattern = ('"node_modules/{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe)
-  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
-}
-
-function Test-YarnHeader { param([string]$Text,[string]$Pkg,[string]$Ver)
-  $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver
-  $pattern = ('^{0}@(\^|~)?{1}(:|\b)' -f $pkgRe, $verRe)
-  return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
-}
-
-# ---------------- Main ----------------
+function Test-FlatJsonMatch { param([string]$Text,[string]$Pkg,[string]$Ver) $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver; $pattern = ('"{0}"\s*:\s*"{1}"' -f $pkgRe, $verRe); return [regex]::IsMatch($Text, $pattern) }
+function Test-DependenciesBlock { param([string]$Text,[string]$Pkg,[string]$Ver) $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver; $pattern = ('"{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe); return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline) }
+function Test-PackagesBlock { param([string]$Text,[string]$Pkg,[string]$Ver) $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver; $pattern = ('"node_modules/{0}"\s*:\s*{{[^}}]*"version"\s*:\s*"{1}"' -f $pkgRe, $verRe); return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline) }
+function Test-YarnHeader { param([string]$Text,[string]$Pkg,[string]$Ver) $pkgRe = Escape-Regex $Pkg; $verRe = Escape-Regex $Ver; $pattern = ('^{0}@(\^|~)?{1}(:|\b)' -f $pkgRe, $verRe); return [regex]::IsMatch($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline) }
 
 $listLines = Get-ListLines -Url $ListUrl -CacheFile $Cache
 $compromised = Parse-CompromisedList -Lines $listLines
@@ -236,19 +138,13 @@ Write-Host ("Info: {0} lockfile(s) found." -f $lockfiles.Count)
 foreach ($f in $lockfiles) { try { $len = (Get-Item $f).Length } catch { $len = 0 }; Write-Host (" - {0} ({1} bytes)" -f $f, $len) }
 if ($lockfiles.Count -eq 0) { Write-Host "No lockfiles found."; exit 0 }
 
-$totalVersions = 0
-foreach ($pkg in $compromised.Keys) { $totalVersions += ($compromised[$pkg]).Count }
+$totalVersions = 0; foreach ($pkg in $compromised.Keys) { $totalVersions += ($compromised[$pkg]).Count }
 $totalChecks = $totalVersions * $lockfiles.Count
 if ($totalChecks -le 0) { Write-Host ("Nothing to check. (total_versions={0}, lockfiles={1})" -f $totalVersions, $lockfiles.Count); exit 0 }
 
-$hitMap = New-Object 'System.Collections.Generic.HashSet[string]'
-$perFileCounts = @{}
-$done = 0; $lastShown = -1
-
-# cache contents
+$hitMap = New-Object 'System.Collections.Generic.HashSet[string]'; $perFileCounts = @{}; $done = 0; $lastShown = -1
 $fileTexts = @{}
 foreach ($file in $lockfiles) { $fileTexts[$file] = Get-Content -LiteralPath $file -Raw }
-
 Write-ProgressPercent 0
 
 foreach ($file in $lockfiles) {
@@ -258,21 +154,14 @@ foreach ($file in $lockfiles) {
     foreach ($ver in $versions) {
       $done++; $percent = [int][Math]::Floor(($done / $totalChecks) * 100)
       if ($percent -gt $lastShown) { Write-ProgressPercent $percent; $lastShown = $percent }
-
       $key = ("{0}|{1}@{2}" -f $file, $pkg, $ver)
       if ($hitMap.Contains($key)) { continue }
-
       $hit = $false
       if (-not $hit) { $hit = Test-FlatJsonMatch -Text $text -Pkg $pkg -Ver $ver }
       if (-not $hit) { $hit = Test-DependenciesBlock -Text $text -Pkg $pkg -Ver $ver }
       if (-not $hit) { $hit = Test-PackagesBlock -Text $text -Pkg $pkg -Ver $ver }
       if (-not $hit) { $hit = Test-YarnHeader -Text $text -Pkg $pkg -Ver $ver }
-
-      if ($hit) {
-        $null = $hitMap.Add($key)
-        if (-not $perFileCounts.ContainsKey($file)) { $perFileCounts[$file] = 0 }
-        $perFileCounts[$file]++
-      }
+      if ($hit) { $null = $hitMap.Add($key); if (-not $perFileCounts.ContainsKey($file)) { $perFileCounts[$file] = 0 }; $perFileCounts[$file]++ }
     }
   }
 }
@@ -299,22 +188,9 @@ if ($hitMap.Count -eq 0) {
   Write-Host "Action: Please update/remove the affected packages and regenerate your lockfiles."
 }
 
-# ---------------- Final behaviour: pause unless AutoExit ----------------
-
-if ($AutoExit.IsPresent) {
-  # explizit aus CI/Workflow übergeben -> nicht pausieren
-  return
-}
-
-# Versuche zu pausieren (Read-Host wirft in non-interactive Hosts)
+if ($AutoExit.IsPresent) { return }
 try {
-  Write-Host ""
-  Write-Host "Press ENTER to return to shell..."
-  Read-Host | Out-Null
-} catch {
-  # Host nicht interaktiv (z.B. CI, -NonInteractive) => einfach beenden
-  Write-Verbose "Non-interactive host detected; exiting immediately."
-  Read-Host | Out-Null
-}
+  Write-Host ""; Write-Host "Press ENTER to return to shell..."
+  [void][System.Console]::ReadLine()
+} catch { try { Read-Host -Prompt 'Press ENTER to return to shell...' | Out-Null } catch { } }
 return
-
