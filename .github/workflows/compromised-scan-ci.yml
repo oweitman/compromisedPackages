@@ -336,51 +336,48 @@ jobs:
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
                   Copy-Item package-lock.bad.json package-lock.json -Force
 
-                  # Alle Streams -> StdOut (fängt auch Write-Host ein)
+                  # Alle Streams -> StdOut (fängt Write-Host etc. ein)
                   $out = & .\compromised.ps1 `
-                      -Cache "$PWD\compromised-packages.txt" `
                       -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
                       *>&1
 
-                  # $out ist ein Objekt-Array; robust in String wandeln:
-                  $text = ($out | ForEach-Object { $_ | Out-String }).TrimEnd()
-
-                  # Optional: ins Artefakt schreiben
+                  # robuster String
+                  $text = [string]::Join("`n", $out)
                   Set-Content -Path pwsh_bad.txt -Value $text
 
-                  if ($text -match 'Total:\s+(\d+)\s+match\(es\)') {
-                      $total = [int]$Matches[1]
+                  # Statt $Matches -> [regex]::Match
+                  $m = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
+                  if ($m.Success) {
+                      $total = [int]$m.Groups[1].Value
                       "Parsed total: $total"
-                      if ($total -lt 1) {
-                        throw "Expected at least one match with BAD fixture (got $total)"
-                      }
-                  } else {
-                      # Fallback: rohen Text zeigen
+                      if ($total -lt 1) { throw "Expected at least one match with BAD fixture (got $total)" }
+                  }
+                  else {
                       Write-Host $text
                       throw "Did not find a 'Total: N match(es)' line in BAD output"
                   }
 
-            - name: Run PowerShell scanner on GOOD (force local list)
-              shell: pwsh
-              run: |
-                  Copy-Item package-lock.good.json package-lock.json -Force
+                  - name: Run PowerShell scanner on GOOD (force local list)
+                  shell: pwsh
+                  run: |
+                      Copy-Item package-lock.good.json package-lock.json -Force
 
-                  $out = & .\compromised.ps1 `
-                      -Cache "$PWD\compromised-packages.txt" `
-                      -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
-                      *>&1
+                      $out = & .\compromised.ps1 `
+                          -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt" `
+                          *>&1
 
-                  $text = ($out | ForEach-Object { $_ | Out-String }).TrimEnd()
-                  Set-Content -Path pwsh_good.txt -Value $text
+                      $text = [string]::Join("`n", $out)
+                      Set-Content -Path pwsh_good.txt -Value $text
 
-                  if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
-                      Write-Host $text
-                      throw "Expected zero matches with GOOD fixture"
-                  }
-                  if ($text -notmatch 'No compromised packages found in lockfiles') {
-                      Write-Host $text
-                      throw "Expected the 'No compromised packages found in lockfiles' message in GOOD output"
-                  }
+                      $m = [regex]::Match($text, 'Total:\s+([1-9]\d*)\s+match\(es\)')
+                      if ($m.Success) {
+                          Write-Host $text
+                          throw "Expected zero matches with GOOD fixture"
+                      }
+                      if ($text -notmatch 'No compromised packages found in lockfiles') {
+                          Write-Host $text
+                          throw "Expected the 'No compromised packages found in lockfiles' message in GOOD output"
+                      }
 
             - name: Upload logs (Windows)
               uses: actions/upload-artifact@v4
