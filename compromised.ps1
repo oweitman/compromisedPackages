@@ -318,7 +318,6 @@ Write-ProgressPercent 100
 # 6) Aggregated output
 if ($hitMap.Count -eq 0) {
   Write-Host "OK: No compromised packages found in lockfiles."
-  exit 0
 }
 
 Write-Host ""
