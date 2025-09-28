@@ -1,16 +1,9 @@
 name: Compromised scanners CI
 
-# Run this workflow when a pull request modifies the compromised list
-# or when triggered manually via the workflow_dispatch input.
 on:
-    # Trigger when the compromised list is modified in a pull request.  The
-    # repository stores this list as `compromised-packages.txt`, so watch that file.
     pull_request:
         paths:
             - 'compromised-packages.txt'
-    # Allow the workflow to be started manually from the Actions tab.  Optional
-    # inputs allow overriding the default branch or the number of entries used
-    # when constructing test fixtures.
     workflow_dispatch:
         inputs:
             ref:
@@ -25,7 +18,6 @@ on:
 permissions:
     contents: read
 
-# Default number of package entries to use when constructing test fixtures.
 env:
     N: ${{ github.event.inputs.entries || '3' }}
 
@@ -35,8 +27,6 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Checkout repository
-              # Use the default behavior of actions/checkout@v4 to automatically checkout the
-              # appropriate commit (PR head SHA for pull_request, workflow ref for manual runs).
               uses: actions/checkout@v4
 
             - name: Ensure Bash scanner is executable
@@ -46,16 +36,8 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  # Use the JSON-formatted list for building fixtures.  Trim the
-                  # version string properly (strip leading/trailing whitespace and
-                  # retain only the first whitespace‑separated token) before
-                  # inserting into the lockfiles.  This avoids empty version
-                  # values when the list contains a space after the colon.
-                  # Use the text list from the repository.  Even though it's named
-                  # with a `.txt` extension, the format is the same (pkg: versions ...).
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
-                  # Read the first N non-comment entries from the list
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
                   if (( ${#entries[@]} == 0 )); then
                     echo "No entries found in compromised list" >&2
@@ -80,31 +62,27 @@ jobs:
                       echo '  "requires": true,'
                       echo '  "packages": {'
                       echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
-                  for i in "${!entries[@]}"; do
+                      for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        # Trim leading/trailing spaces, then take the first token only
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
                       done
                       echo '  },'
                       echo '  "dependencies": {'
-                  for i in "${!entries[@]}"; do
+                      for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
                       done
                       echo '  },'
                       echo '  "flat_versions": {'
-                  for i in "${!entries[@]}"; do
+                      for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": "%s"' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -116,12 +94,23 @@ jobs:
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
+            - name: Upload fixtures (good/bad package-lock.json)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-fixtures
+                  path: |
+                      package-lock.bad.json
+                      package-lock.good.json
+                  if-no-files-found: error
+                  retention-days: 14
+
             - name: Run Bash scanner on BAD fixture (should find at least one match)
               shell: bash
               run: |
                   set -euo pipefail
                   cp package-lock.bad.json package-lock.json
-                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_bad.txt
+                  # Nur lokale Liste verwenden (kein externer Download)
+                  ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_bad.txt
                   total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || echo "")
                   echo "Total matches in BAD fixture: ${total:-0}"
                   if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
@@ -134,33 +123,35 @@ jobs:
               run: |
                   set -euo pipefail
                   cp package-lock.good.json package-lock.json
-                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_good.txt
+                  # Nur lokale Liste verwenden (kein externer Download)
+                  ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_good.txt
                   if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
                     echo "Expected zero matches with GOOD fixture" >&2
                     exit 1
                   fi
                   grep -q 'No compromised packages found in lockfiles' bash_good.txt
 
+            - name: Upload logs
+              uses: actions/upload-artifact@v4
+              with:
+                  name: linux-logs
+                  path: |
+                      bash_bad.txt
+                      bash_good.txt
+                  if-no-files-found: error
+                  retention-days: 14
+
     windows-pwsh:
         name: PowerShell scanner (Windows)
         runs-on: windows-latest
         steps:
             - name: Checkout repository
-              # Use the default behavior of actions/checkout@v4 to automatically checkout the
-              # appropriate commit (PR head SHA for pull_request, workflow ref for manual runs).
               uses: actions/checkout@v4
 
             - name: Generate test fixtures
               shell: bash
               run: |
                   set -euo pipefail
-                  # Use the JSON-formatted list for building fixtures.  Trim the
-                  # version string properly (strip leading/trailing whitespace and
-                  # retain only the first whitespace‑separated token) before
-                  # inserting into the lockfiles.  This avoids empty version
-                  # values when the list contains a space after the colon.
-                  # Use the text list from the repository.  Even though it's named
-                  # with a `.txt` extension, the format is the same (pkg: versions ...).
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
@@ -189,9 +180,7 @@ jobs:
                       echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
                       for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        # Trim leading/trailing spaces, then take the first token only
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -200,8 +189,7 @@ jobs:
                       echo '  "dependencies": {'
                       for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -210,8 +198,7 @@ jobs:
                       echo '  "flat_versions": {'
                       for i in "${!entries[@]}"; do
                         l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"
-                        ver="$(echo "$ver" | xargs)"
-                        ver="${ver%% *}"
+                        ver="$(echo "$ver" | xargs)"; ver="${ver%% *}"
                         [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
                         printf '    "%s": "%s"' "$pkg" "$ver"
                         [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
@@ -223,13 +210,25 @@ jobs:
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
+            - name: Upload fixtures (good/bad package-lock.json)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-fixtures
+                  path: |
+                      package-lock.bad.json
+                      package-lock.good.json
+                  if-no-files-found: error
+                  retention-days: 14
+
             - name: Run PowerShell scanner on BAD fixture (should find at least one match)
               shell: pwsh
               run: |
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
                   Copy-Item package-lock.bad.json -Destination package-lock.json -Force
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.example"
+                  # Nur lokale Liste verwenden (kein externer Download)
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
                   $text = $out -join "`n"
+                  Set-Content -Path pwsh_bad.txt -Value $text -NoNewline
                   $match = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
                   if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
                     Write-Host $text
@@ -240,13 +239,25 @@ jobs:
               shell: pwsh
               run: |
                   Copy-Item package-lock.good.json -Destination package-lock.json -Force
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.example"
+                  # Nur lokale Liste verwenden (kein externer Download)
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
                   $text = $out -join "`n"
+                  Set-Content -Path pwsh_good.txt -Value $text -NoNewline
                   if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
                     Write-Host $text
                     throw "Expected zero matches with GOOD fixture"
                   }
                   if ($text -notmatch 'No compromised packages found in lockfiles') {
                     Write-Host $text
-                    throw "Expected the 'No compromised packages' message in GOOD fixture"
+                    throw "Expected the ''No compromised packages'' message in GOOD fixture"
                   }
+
+            - name: Upload logs
+              uses: actions/upload-artifact@v4
+              with:
+                  name: windows-logs
+                  path: |
+                      pwsh_bad.txt
+                      pwsh_good.txt
+                  if-no-files-found: error
+                  retention-days: 14
