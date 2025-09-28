@@ -1,0 +1,155 @@
+name: Compromised package scanners (Bash & PowerShell)
+
+on:
+    pull_request:
+        paths:
+            - 'compromised-packages.txt'
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    linux-bash:
+        name: Bash scanner on Ubuntu
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout PR head
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.pull_request.head.sha }}
+
+            - name: Show list stats
+              run: |
+                  echo "Lines (non-comment): $(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | wc -l)"
+                  head -n 10 compromised-packages.txt || true
+
+            - name: Generate synthetic package-lock.json from the list (first 3 entries)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | head -n 3)
+                  if (( ${#entries[@]} == 0 )); then
+                    echo "No entries in list; nothing to test." >&2
+                    exit 1
+                  fi
+                  echo '{' > package-lock.json
+                  echo '  "name": "ci-test",' >> package-lock.json
+                  echo '  "version": "1.0.0",' >> package-lock.json
+                  echo '  "lockfileVersion": 2,' >> package-lock.json
+                  echo '  "requires": true,' >> package-lock.json
+                  echo '  "packages": {' >> package-lock.json
+                  echo '    "": { "name": "ci-test", "version": "1.0.0" },' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    # node_modules block
+                    printf '    "node_modules/%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  },' >> package-lock.json
+                  echo '  "dependencies": {' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    printf '    "%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  },' >> package-lock.json
+                  echo '  "flat_versions": {' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    printf '    "%s": "%s",\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  }' >> package-lock.json
+                  echo '}' >> package-lock.json
+
+                  echo "package-lock.json preview:"
+                  sed -n '1,80p' package-lock.json
+
+            - name: Run Bash scanner (force cache, avoid network)
+              shell: bash
+              run: |
+                  chmod +x ./compromised.sh
+                  # Use local list via --cache-file; give an invalid URL to trigger cache fallback if needed
+                  set -o pipefail
+                  ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.localhost/list 2>&1 | tee bash_run.txt
+                  echo "---- tail ----"
+                  tail -n 20 bash_run.txt
+
+            - name: Assert Bash found at least 1 match
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  total=$(grep -Eo '^Total: [0-9]+' bash_run.txt | awk '{print $2}' | tail -n1)
+                  if [[ -z "${total:-}" ]]; then
+                    echo "Could not parse Total from Bash output"; cat bash_run.txt; exit 1
+                  fi
+                  echo "Total matches (Bash): $total"
+                  if (( total < 1 )); then
+                    echo "Bash scanner reported zero matches"; exit 1
+                  fi
+
+    windows-pwsh:
+        name: PowerShell scanner on Windows
+        runs-on: windows-latest
+        steps:
+            - name: Checkout PR head
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.pull_request.head.sha }}
+
+            - name: Generate synthetic package-lock.json from the list (first 3 entries)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' compromised-packages.txt | head -n 3)
+                  if (( ${#entries[@]} == 0 )); then
+                    echo "No entries in list; nothing to test." >&2
+                    exit 1
+                  fi
+                  echo '{' > package-lock.json
+                  echo '  "name": "ci-test",' >> package-lock.json
+                  echo '  "version": "1.0.0",' >> package-lock.json
+                  echo '  "lockfileVersion": 2,' >> package-lock.json
+                  echo '  "requires": true,' >> package-lock.json
+                  echo '  "packages": {' >> package-lock.json
+                  echo '    "": { "name": "ci-test", "version": "1.0.0" },' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    printf '    "node_modules/%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  },' >> package-lock.json
+                  echo '  "dependencies": {' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    printf '    "%s": { "version": "%s" },\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  },' >> package-lock.json
+                  echo '  "flat_versions": {' >> package-lock.json
+                  for l in "${entries[@]}"; do
+                    pkg="${l%%:*}"; vers="${l#*:}"; vers="${vers%% *}"
+                    printf '    "%s": "%s",\n' "$pkg" "$vers" >> package-lock.json
+                  done
+                  echo '  }' >> package-lock.json
+                  echo '}' >> package-lock.json
+
+            - name: Run PowerShell scanner (force cache, avoid network)
+              shell: pwsh
+              run: |
+                  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+                  if (-not (Test-Path .\compromised.ps1)) { Write-Error "compromised.ps1 not found"; exit 1 }
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "https://invalid.localhost/list" 2>&1
+                  $out | Tee-Object -FilePath pwsh_run.txt
+                  Write-Host "---- tail ----"
+                  Get-Content pwsh_run.txt | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+
+            - name: Assert PowerShell found at least 1 match
+              shell: pwsh
+              run: |
+                  $content = Get-Content pwsh_run.txt -Raw
+                  # Match: "Total: N match(es)"
+                  $m = [regex]::Match($content, 'Total:\s+(\d+)\s+match\(es\)')
+                  if (-not $m.Success) {
+                    Write-Host $content
+                    throw "Could not parse Total from PowerShell output"
+                  }
+                  $total = [int]$m.Groups[1].Value
+                  Write-Host ("Total matches (PowerShell): {0}" -f $total)
+                  if ($total -lt 1) { throw "PowerShell scanner reported zero matches" }

@@ -1,0 +1,22 @@
+{
+  "name": "fixture-test",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": { "name": "fixture-test", "version": "1.0.0" },
+    "node_modules/@ahmedhfarag/ngx-perfect-scrollbar": { "version": "" },
+    "node_modules/@ahmedhfarag/ngx-virtual-scroller": { "version": "" },
+    "node_modules/@art-ws/common": { "version": "" }
+  },
+  "dependencies": {
+    "@ahmedhfarag/ngx-perfect-scrollbar": { "version": "" },
+    "@ahmedhfarag/ngx-virtual-scroller": { "version": "" },
+    "@art-ws/common": { "version": "" }
+  },
+  "flat_versions": {
+    "@ahmedhfarag/ngx-perfect-scrollbar": "",
+    "@ahmedhfarag/ngx-virtual-scroller": "",
+    "@art-ws/common": ""
+  }
+}
