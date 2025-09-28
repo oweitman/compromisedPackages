@@ -1,12 +1,16 @@
 name: Compromised scanners CI
 
-# Auslöser: Pull Request auf die Haupt-Skripte oder manuelles Starten
+# Run this workflow when a pull request modifies the compromised list
+# or when triggered manually via the workflow_dispatch input.
 on:
+    # Trigger when the compromised list is modified in a pull request.  Note: the
+    # file watched here is `compromised-packages.json` per the user's request.
     pull_request:
         paths:
-            - 'compromised-packages.txt'
-            - 'compromised.sh'
-            - 'compromised.ps1'
+            - 'compromised-packages.json'
+    # Allow the workflow to be started manually from the Actions tab.  Optional
+    # inputs allow overriding the default branch or the number of entries used
+    # when constructing test fixtures.
     workflow_dispatch:
         inputs:
             ref:
@@ -14,15 +18,15 @@ on:
                 required: false
                 default: ''
             entries:
-                description: 'Number of entries from the list to use in test fixtures (default 3)'
+                description: 'Number of entries from the list to use when building test fixtures (default 3)'
                 required: false
                 default: '3'
 
 permissions:
     contents: read
 
+# Default number of package entries to use when constructing test fixtures.
 env:
-    # default number of list entries used to build fixtures (override via workflow_dispatch.inputs.entries)
     N: ${{ github.event.inputs.entries || '3' }}
 
 jobs:
@@ -30,14 +34,15 @@ jobs:
         name: Bash scanner (Ubuntu)
         runs-on: ubuntu-latest
         steps:
-            - name: Checkout PR head or dispatch ref
-            - uses: actions/checkout@v4
+            - name: Checkout repository
+              uses: actions/checkout@v4
               with:
-                  ref:
-                      ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
-                      || (inputs.ref != '' && inputs.ref || github.sha) }}
+                  # Determine the ref dynamically: use the PR head SHA when triggered by a pull_request,
+                  # otherwise fall back to the ref specified via workflow_dispatch input or the current
+                  # GitHub ref.  The logical ORs fall back to the next value if the previous is empty.
+                  ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref }}
 
-            - name: Make compromised.sh executable
+            - name: Ensure Bash scanner is executable
               run: chmod +x ./compromised.sh
 
             - name: Generate test fixtures
@@ -46,7 +51,7 @@ jobs:
                   set -euo pipefail
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
-                  # Grep first N non-comment lines
+                  # Read the first N non-comment entries from the list
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
                   if (( ${#entries[@]} == 0 )); then
                     echo "No entries found in compromised list" >&2
@@ -55,7 +60,8 @@ jobs:
                   bump_ver() {
                     local v="$1"
                     if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
-                      echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3]+1000))${BASH_REMATCH[4]}"
+                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
+                      echo "${major}.${minor}.$((patch+1000))${tail}"
                     else
                       echo "${v}.9999"
                     fi
@@ -98,57 +104,103 @@ jobs:
                   }
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
-                  echo "fixtures created"
 
-            - name: Run Bash scanner on BAD fixture (expect match)
+            - name: Run Bash scanner on BAD fixture (should find at least one match)
               shell: bash
               run: |
                   set -euo pipefail
                   cp package-lock.bad.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_bad.txt
                   total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || echo "")
-                  [ -n "$total" ] && [ "$total" -ge 1 ] || (echo "BAD fixture expected at least one match" && exit 1)
+                  echo "Total matches in BAD fixture: ${total:-0}"
+                  if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
+                    echo "Expected at least one match with BAD fixture" >&2
+                    exit 1
+                  fi
 
-            - name: Run Bash scanner on GOOD fixture (expect zero)
+            - name: Run Bash scanner on GOOD fixture (should find zero matches)
               shell: bash
               run: |
                   set -euo pipefail
                   cp package-lock.good.json package-lock.json
                   ./compromised.sh --cache-file compromised-packages.txt --list-url https://invalid.example 2>&1 | tee bash_good.txt
-                  ! grep -q '^Total: [1-9][0-9]*' bash_good.txt
+                  if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
+                    echo "Expected zero matches with GOOD fixture" >&2
+                    exit 1
+                  fi
+                  grep -q 'No compromised packages found in lockfiles' bash_good.txt
 
     windows-pwsh:
         name: PowerShell scanner (Windows)
         runs-on: windows-latest
         steps:
-            - name: Checkout PR head or dispatch ref
+            - name: Checkout repository
               uses: actions/checkout@v4
               with:
-                  ref:
-                      ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
-                      || (inputs.ref != '' && inputs.ref || github.sha) }}
+                  # Same dynamic ref logic as the linux job.  Use the PR head SHA for pull_request
+                  # events or the provided input ref or current GitHub ref for manual runs.
+                  ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref }}
 
-            - name: Generate fixtures from list
+            - name: Generate test fixtures
               shell: bash
               run: |
-                  # Same generation as above (bash for convenience in Windows job)
                   set -euo pipefail
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
+                  if (( ${#entries[@]} == 0 )); then
+                    echo "No entries found in compromised list" >&2
+                    exit 1
+                  fi
                   bump_ver() {
                     local v="$1"
                     if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
-                      echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3]+1000))${BASH_REMATCH[4]}"
+                      local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}" tail="${BASH_REMATCH[4]}"
+                      echo "${major}.${minor}.$((patch+1000))${tail}"
                     else
                       echo "${v}.9999"
                     fi
                   }
-                  build_plock() { ... } # identical to the linux job snippet
+                  build_plock() {
+                    local outfile="$1" mode="$2"
+                    {
+                      echo '{'
+                      echo '  "name": "fixture-test",'
+                      echo '  "version": "1.0.0",'
+                      echo '  "lockfileVersion": 2,'
+                      echo '  "requires": true,'
+                      echo '  "packages": {'
+                      echo '    "": { "name": "fixture-test", "version": "1.0.0" },'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "node_modules/%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+                      echo '  "dependencies": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": { "version": "%s" }' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  },'
+                      echo '  "flat_versions": {'
+                      for i in "${!entries[@]}"; do
+                        l="${entries[$i]}"; pkg="${l%%:*}"; ver="${l#*:}"; ver="${ver%% *}"
+                        [[ "$mode" == "good" ]] && ver="$(bump_ver "$ver")"
+                        printf '    "%s": "%s"' "$pkg" "$ver"
+                        [[ $i -lt $((${#entries[@]}-1)) ]] && echo ',' || echo
+                      done
+                      echo '  }'
+                      echo '}'
+                    } > "$outfile"
+                  }
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
-            - name: Run PowerShell scanner on BAD fixture (expect match)
+            - name: Run PowerShell scanner on BAD fixture (should find at least one match)
               shell: pwsh
               run: |
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
@@ -158,10 +210,10 @@ jobs:
                   $match = [regex]::Match($text, 'Total:\s+(\d+)\s+match\(es\)')
                   if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
                     Write-Host $text
-                    throw "BAD fixture expected at least one match"
+                    throw "Expected at least one match with BAD fixture"
                   }
 
-            - name: Run PowerShell scanner on GOOD fixture (expect zero)
+            - name: Run PowerShell scanner on GOOD fixture (should find zero matches)
               shell: pwsh
               run: |
                   Copy-Item package-lock.good.json -Destination package-lock.json -Force
@@ -169,5 +221,9 @@ jobs:
                   $text = $out -join "`n"
                   if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
                     Write-Host $text
-                    throw "GOOD fixture should not find any matches"
+                    throw "Expected zero matches with GOOD fixture"
+                  }
+                  if ($text -notmatch 'No compromised packages found in lockfiles') {
+                    Write-Host $text
+                    throw "Expected the 'No compromised packages' message in GOOD fixture"
                   }
