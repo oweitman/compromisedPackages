@@ -3,11 +3,17 @@
   compromised.ps1
   Scans ONLY the current directory for lockfiles and reports compromised packages.
 
+  Behaviour change: the script will *pause before exit* by default (so you keep the
+  output visible and can press ENTER to return to the calling shell). If you want
+  the script to automatically exit (e.g. in CI / GitHub Actions), pass the
+  -AutoExit switch.
+
   Parameters:
     -ListUrl     : URL of the compromised package list
     -Cache       : optional cache file path for the list
     -ShowContent : switch to print first lines of the list
     -ShowLines   : number of lines to print with -ShowContent (default 200)
+    -AutoExit    : switch; if present the script will not pause and exits immediately
 #>
 
 [CmdletBinding()]
@@ -15,7 +21,8 @@ param(
   [string]$ListUrl = 'https://raw.githubusercontent.com/oweitman/compromisedPackages/main/compromised-packages.txt',
   [string]$Cache,
   [switch]$ShowContent,
-  [int]$ShowLines = 200
+  [int]$ShowLines = 200,
+  [switch]$AutoExit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +46,7 @@ function Test-IsHtmlPreview {
 function Convert-FileUrlToLocalPath {
   param([string]$Url)
   # strip scheme
-  $local = $Url -replace '^[Ff][Ii][Ll][Ee]:\/\/\/?', ''
+  $local = $Url -replace '^[Ff][Ii][Ll][Ee]:\\/\\/\\/?', ''
   # decode %-escapes
   try {
     $local = [System.Uri]::UnescapeDataString($local)
@@ -47,7 +54,7 @@ function Convert-FileUrlToLocalPath {
     # ignore decode errors
   }
   # On Windows, convert forward slashes to backslashes for Test-Path friendly path
-  if ($IsWindows) { $local = $local -replace '/', '\' }
+  if ($IsWindows) { $local = $local -replace '/', '\\' }
   return $local
 }
 
@@ -60,7 +67,7 @@ function Get-ListLines {
   Write-Host ("Downloading compromised package list from: {0}" -f $Url)
 
   # If the URL is a local file URL (file://), treat it specially
-  if ($Url -match '^[Ff][Ii][Ll][Ee]:\/\/\/?') {
+  if ($Url -match '^[Ff][Ii][Ll][Ee]:\\/\\/\\/?') {
     $localPath = Convert-FileUrlToLocalPath -Url $Url
     if (-not (Test-Path -LiteralPath $localPath)) {
       throw "Local list file not found: $localPath"
@@ -179,7 +186,7 @@ function Parse-CompromisedList {
     $versPart = $line.Substring($idx + 1).Trim()
     if (-not $pkg -or -not $versPart) { continue }
 
-    $versions = $versPart -split '\s+' | Where-Object { $_ -ne '' }
+    $versions = $versPart -split '\\s+' | Where-Object { $_ -ne '' }
     if ($versions.Count -gt 0) {
       $dict[$pkg] = $versions
     }
@@ -318,29 +325,59 @@ Write-ProgressPercent 100
 # 6) Aggregated output
 if ($hitMap.Count -eq 0) {
   Write-Host "OK: No compromised packages found in lockfiles."
-}
+} else {
+  Write-Host ""
+  Write-Host "Results (aggregated):"
+  $totalHits = 0
+  foreach ($f in $lockfiles) {
+    $count = 0
+    if ($perFileCounts.ContainsKey($f)) { $count = $perFileCounts[$f] }
+    if ($count -le 0) { continue }
+    Write-Host ("- {0}  --  {1} match(es)" -f $f, $count)
 
-Write-Host ""
-Write-Host "Results (aggregated):"
-$totalHits = 0
-foreach ($f in $lockfiles) {
-  $count = 0
-  if ($perFileCounts.ContainsKey($f)) { $count = $perFileCounts[$f] }
-  if ($count -le 0) { continue }
-  Write-Host ("- {0}  --  {1} match(es)" -f $f, $count)
+    $hitsForFile =
+      $hitMap |
+      Where-Object { $_.StartsWith("$f|") } |
+      Sort-Object
 
-  $hitsForFile =
-    $hitMap |
-    Where-Object { $_.StartsWith("$f|") } |
-    Sort-Object
-
-  foreach ($kv in $hitsForFile) {
-    $pkgver = $kv.Substring($f.Length + 1)
-    Write-Host ("   * {0}" -f $pkgver)
-    $totalHits++
+    foreach ($kv in $hitsForFile) {
+      $pkgver = $kv.Substring($f.Length + 1)
+      Write-Host ("   * {0}" -f $pkgver)
+      $totalHits++
+    }
   }
+
+  Write-Host ""
+  Write-Host ("Total: {0} match(es) in {1} file(s)." -f $totalHits, $lockfiles.Count)
+  Write-Host "Action: Please update/remove the affected packages and regenerate your lockfiles."
 }
 
-Write-Host ""
-Write-Host ("Total: {0} match(es) in {1} file(s)." -f $totalHits, $lockfiles.Count)
-Write-Host "Action: Please update/remove the affected packages and regenerate your lockfiles."
+# ---------------- Final behaviour: pause unless AutoExit or non-interactive ----------------
+# Determine whether we have a console available (try/catch because [Console] may throw when no host)
+$hasConsole = $false
+try {
+  # Accessing KeyAvailable throws if no console
+  $null = [System.Console]::KeyAvailable
+  $hasConsole = $true
+} catch {
+  $hasConsole = $false
+}
+
+# Decide: auto-exit if -AutoExit passed OR running in CI OR no console detected
+$shouldAutoExit = $AutoExit.IsPresent -or [bool]$env:CI -or (-not $hasConsole)
+
+if ($shouldAutoExit) {
+  # Explicitly return to caller (script ends)
+  return
+} else {
+  # Interactive: wait for user to press ENTER so output remains visible
+  try {
+    Write-Host ""
+    Write-Host "Press ENTER to return to shell..."
+    [void][System.Console]::ReadLine()
+  } catch {
+    # Fallback if Console.ReadLine not available
+    try { Read-Host -Prompt 'Press ENTER to return to shell...' } catch { }
+  }
+  return
+}
