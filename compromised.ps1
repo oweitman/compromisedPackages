@@ -314,6 +314,7 @@ try {
 } catch {
   # Host nicht interaktiv (z.B. CI, -NonInteractive) => einfach beenden
   Write-Verbose "Non-interactive host detected; exiting immediately."
+  Read-Host | Out-Null
 }
 return
 
