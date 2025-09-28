@@ -299,23 +299,21 @@ if ($hitMap.Count -eq 0) {
   Write-Host "Action: Please update/remove the affected packages and regenerate your lockfiles."
 }
 
-# ---------------- Final behaviour: pause unless AutoExit or non-interactive ----------------
+# ---------------- Final behaviour: pause unless AutoExit ----------------
 
-$hasConsole = $false
-try {
-  $null = [System.Console]::KeyAvailable
-  $hasConsole = $true
-} catch { $hasConsole = $false }
-
-$shouldAutoExit = $AutoExit.IsPresent -or ([bool]$env:CI) -or (-not $hasConsole)
-
-if ($shouldAutoExit) { return } else {
-  try {
-    Write-Host ""; Write-Host "Press ENTER to return to shell..."
-    # prefer Read-Host where Console.ReadLine might not be available
-    Read-Host | Out-Null
-  } catch {
-    try { [Console]::ReadLine() | Out-Null } catch { }
-  }
+if ($AutoExit.IsPresent) {
+  # explizit aus CI/Workflow übergeben -> nicht pausieren
   return
 }
+
+# Versuche zu pausieren (Read-Host wirft in non-interactive Hosts)
+try {
+  Write-Host ""
+  Write-Host "Press ENTER to return to shell..."
+  Read-Host | Out-Null
+} catch {
+  # Host nicht interaktiv (z.B. CI, -NonInteractive) => einfach beenden
+  Write-Verbose "Non-interactive host detected; exiting immediately."
+}
+return
+
