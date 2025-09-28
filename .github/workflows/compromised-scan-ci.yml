@@ -40,7 +40,7 @@ jobs:
                   # Determine the ref dynamically: use the PR head SHA when triggered by a pull_request,
                   # otherwise fall back to the ref specified via workflow_dispatch input or the current
                   # GitHub ref.  The logical ORs fall back to the next value if the previous is empty.
-                  ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref }}
+                  ref: ${{ github.event.pull_request.head.sha || github.event.inputs.ref || github.ref }}
 
             - name: Ensure Bash scanner is executable
               run: chmod +x ./compromised.sh
@@ -139,7 +139,7 @@ jobs:
               with:
                   # Same dynamic ref logic as the linux job.  Use the PR head SHA for pull_request
                   # events or the provided input ref or current GitHub ref for manual runs.
-                  ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.ref }}
+                  ref: ${{ github.event.pull_request.head.sha || github.event.inputs.ref || github.ref }}
 
             - name: Generate test fixtures
               shell: bash
