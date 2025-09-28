@@ -32,17 +32,33 @@ jobs:
             - name: Ensure Bash scanner is executable
               run: chmod +x ./compromised.sh
 
-            - name: Generate test fixtures
+            - name: Generate test fixtures (+ export sample pkg/ver)
               shell: bash
               run: |
                   set -euo pipefail
                   LIST="compromised-packages.txt"
                   N="${N:-3}"
+
+                  # Pick first N non-comment lines
                   mapfile -t entries < <(grep -E '^[[:space:]]*[^#[:space:]]' "$LIST" | head -n "$N")
                   if (( ${#entries[@]} == 0 )); then
                     echo "No entries found in compromised list" >&2
                     exit 1
                   fi
+
+                  # Save the *first* entry as sample for later verification
+                  first="${entries[0]}"
+                  first_pkg="${first%%:*}"
+                  first_ver_raw="${first#*:}"
+                  # normalize: trim + take first token only (as beim Fixture-Bau)
+                  first_ver="$(echo "$first_ver_raw" | xargs)"; first_ver="${first_ver%% *}"
+
+                  {
+                    echo "SAMPLE_PKG=$first_pkg"
+                    echo "SAMPLE_VER_BAD=$first_ver"
+                  } >> "$GITHUB_ENV"
+
+                  # Helper to make a "far future" non-matching version
                   bump_ver() {
                     local v="$1"
                     if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
@@ -52,6 +68,10 @@ jobs:
                       echo "${v}.9999"
                     fi
                   }
+
+                  # Also export the GOOD version we will use (bumped)
+                  echo "SAMPLE_VER_GOOD=$(bump_ver "$first_ver")" >> "$GITHUB_ENV"
+
                   build_plock() {
                     local outfile="$1" mode="$2"
                     {
@@ -91,10 +111,11 @@ jobs:
                       echo '}'
                     } > "$outfile"
                   }
+
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
-            - name: Upload fixtures (good/bad package-lock.json)
+            - name: Upload fixtures
               uses: actions/upload-artifact@v4
               with:
                   name: linux-fixtures
@@ -103,6 +124,37 @@ jobs:
                       package-lock.good.json
                   if-no-files-found: error
                   retention-days: 14
+
+            - name: Sanity check with jq/grep (BAD must contain SAMPLE_PKG@SAMPLE_VER_BAD)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  echo "Sample: $SAMPLE_PKG @ $SAMPLE_VER_BAD"
+
+                  # 1) jq: check all three locations we generated
+                  jq -e --arg p "$SAMPLE_PKG" --arg v "$SAMPLE_VER_BAD" '
+                    (.flat_versions[$p] == $v)
+                    or (.dependencies[$p].version == $v)
+                    or (.packages["node_modules/" + $p].version == $v)
+                  ' package-lock.bad.json >/dev/null || { echo "jq check failed: sample not present in BAD"; exit 1; }
+
+                  # 2) grep fallback (flat_versions line)
+                  if ! grep -E "\"$(printf '%s' "$SAMPLE_PKG" | sed 's/[][(){}.^$+*?|\\/]/\\&/g')\"[[:space:]]*:[[:space:]]*\"$(printf '%s' "$SAMPLE_VER_BAD" | sed 's/[][(){}.^$+*?|\\/]/\\&/g')\"" package-lock.bad.json >/dev/null; then
+                    echo "grep check (flat_versions) did not see the sample in BAD"
+                    # print helpful context
+                    grep -n "\"$SAMPLE_PKG\"" package-lock.bad.json || true
+                    exit 1
+                  fi
+
+            - name: Sanity check with jq/grep (GOOD must NOT contain SAMPLE_PKG@SAMPLE_VER_BAD)
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  jq -e --arg p "$SAMPLE_PKG" --arg v "$SAMPLE_VER_BAD" '
+                    (.flat_versions[$p] == $v)
+                    or (.dependencies[$p].version == $v)
+                    or (.packages["node_modules/" + $p].version == $v)
+                  ' package-lock.good.json >/dev/null && { echo "Sample unexpectedly present in GOOD"; exit 1; } || true
 
             - name: Diagnose sizes & hashes after generation (Linux)
               shell: bash
@@ -114,35 +166,23 @@ jobs:
                     md5sum "$f" | awk '{print "md5:",$1}'
                     sha256sum "$f" | awk '{print "sha256:",$1}'
                     printf 'file(1): '; file -b "$f" || true
-                    echo "First 128 bytes (hex):"; xxd -g 1 -l 128 "$f" || true
                     echo
                   done
 
-            - name: Run Bash scanner on BAD fixture (with deep verify)
+            - name: Run Bash scanner on BAD (force local list + verify)
               shell: bash
               run: |
                   set -euo pipefail
                   cp -f package-lock.bad.json package-lock.json
 
-                  echo "== Verify copied package-lock.json (BAD) =="
-                  echo -n "bytes: "; wc -c < package-lock.json
-                  echo -n "md5:   "; md5sum package-lock.json | awk '{print $1}'
-                  echo -n "sha256:"; sha256sum package-lock.json | awk '{print $1}'
-                  echo "cmp vs. package-lock.bad.json:"
-                  if cmp -s package-lock.bad.json package-lock.json; then
-                    echo "IDENTICAL"
-                  else
-                    echo "DIFFERS"
-                    echo "--- diff -u ---"
-                    diff -u package-lock.bad.json package-lock.json || true
-                    echo "--- hexdump A (bad) ---"; xxd -g 1 -l 256 package-lock.bad.json || true
-                    echo "--- hexdump B (used) ---"; xxd -g 1 -l 256 package-lock.json || true
-                  fi
-                  echo "file(1): $(file -b package-lock.json || true)"
-                  echo "CR (0x0D) count:"; tr -cd '\r' < package-lock.json | wc -c | awk '{print $1}'
+                  # Force local list (no network variability)
+                  ./compromised.sh \
+                    --list-url "file://$PWD/compromised-packages.txt" \
+                    --cache-file "$PWD/compromised-packages.txt" \
+                    --show-content --show-lines 10 \
+                    2>&1 | tee bash_bad.txt
 
-                  ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_bad.txt
-
+                  # Must find at least one match
                   total=$(grep -Eo '^Total: [0-9]+' bash_bad.txt | awk '{print $2}' | tail -n1 || echo "")
                   echo "Total matches in BAD fixture: ${total:-0}"
                   if [[ -z "${total:-}" || "${total}" -lt 1 ]]; then
@@ -158,41 +198,23 @@ jobs:
                   if-no-files-found: error
                   retention-days: 14
 
-            - name: Run Bash scanner on GOOD fixture (with deep verify)
+            - name: Run Bash scanner on GOOD (force local list + verify)
               shell: bash
               run: |
                   set -euo pipefail
                   cp -f package-lock.good.json package-lock.json
 
-                  echo "== Verify copied package-lock.json (GOOD) =="
-                  echo -n "bytes: "; wc -c < package-lock.json
-                  echo -n "md5:   "; md5sum package-lock.json | awk '{print $1}'
-                  echo -n "sha256:"; sha256sum package-lock.json | awk '{print $1}'
-                  echo "cmp vs. package-lock.good.json:"
-                  if cmp -s package-lock.good.json package-lock.json; then
-                    echo "IDENTICAL"
-                  else
-                    echo "DIFFERS"
-                    echo "--- diff -u ---"
-                    diff -u package-lock.good.json package-lock.json || true
-                    echo "--- hexdump A (good) ---"; xxd -g 1 -l 256 package-lock.good.json || true
-                    echo "--- hexdump B (used) ---"; xxd -g 1 -l 256 package-lock.json || true
-                  fi
+                  ./compromised.sh \
+                    --list-url "file://$PWD/compromised-packages.txt" \
+                    --cache-file "$PWD/compromised-packages.txt" \
+                    2>&1 | tee bash_good.txt
 
-                  ./compromised.sh --cache-file compromised-packages.txt 2>&1 | tee bash_good.txt
+                  # Must be zero
                   if grep -q '^Total: [1-9][0-9]*' bash_good.txt; then
                     echo "Expected zero matches with GOOD fixture" >&2
                     exit 1
                   fi
                   grep -q 'No compromised packages found in lockfiles' bash_good.txt
-
-            - name: Upload scanned GOOD file (exact input)
-              uses: actions/upload-artifact@v4
-              with:
-                  name: linux-scanned-good-input
-                  path: package-lock.json
-                  if-no-files-found: error
-                  retention-days: 14
 
             - name: Upload logs (Linux)
               uses: actions/upload-artifact@v4
@@ -211,7 +233,7 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v4
 
-            - name: Generate test fixtures
+            - name: Generate test fixtures (+ export sample pkg/ver)
               shell: bash
               run: |
                   set -euo pipefail
@@ -222,6 +244,16 @@ jobs:
                     echo "No entries found in compromised list" >&2
                     exit 1
                   fi
+                  first="${entries[0]}"
+                  first_pkg="${first%%:*}"
+                  first_ver_raw="${first#*:}"
+                  first_ver="$(echo "$first_ver_raw" | xargs)"; first_ver="${first_ver%% *}"
+
+                  {
+                    echo "SAMPLE_PKG=$first_pkg"
+                    echo "SAMPLE_VER_BAD=$first_ver"
+                  } >> "$GITHUB_ENV"
+
                   bump_ver() {
                     local v="$1"
                     if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)?$ ]]; then
@@ -231,6 +263,8 @@ jobs:
                       echo "${v}.9999"
                     fi
                   }
+                  echo "SAMPLE_VER_GOOD=$(bump_ver "$first_ver")" >> "$GITHUB_ENV"
+
                   build_plock() {
                     local outfile="$1" mode="$2"
                     {
@@ -270,10 +304,11 @@ jobs:
                       echo '}'
                     } > "$outfile"
                   }
+
                   build_plock package-lock.bad.json bad
                   build_plock package-lock.good.json good
 
-            - name: Upload fixtures (good/bad package-lock.json)
+            - name: Upload fixtures
               uses: actions/upload-artifact@v4
               with:
                   name: windows-fixtures
@@ -283,52 +318,23 @@ jobs:
                   if-no-files-found: error
                   retention-days: 14
 
-            - name: Diagnose sizes & hashes after generation (Windows)
-              shell: pwsh
+            - name: Sanity check with jq (via Git Bash) — BAD contains sample
+              shell: bash
               run: |
-                  Set-StrictMode -Version Latest
-                  foreach ($f in 'package-lock.bad.json','package-lock.good.json') {
-                    Write-Host "== $f =="
-                    $bytes = (Get-Item $f).Length
-                    "bytes: $bytes"
-                    "md5:   " + (Get-FileHash -Path $f -Algorithm MD5).Hash.ToLower()
-                    "sha256:" + (Get-FileHash -Path $f -Algorithm SHA256).Hash.ToLower()
-                    "First 128 bytes (hex):"
-                    Format-Hex -Path $f -Count 128 | Out-String | Write-Host
-                    ""
-                  }
+                  set -euo pipefail
+                  jq -e --arg p "$SAMPLE_PKG" --arg v "$SAMPLE_VER_BAD" '
+                    (.flat_versions[$p] == $v)
+                    or (.dependencies[$p].version == $v)
+                    or (.packages["node_modules/" + $p].version == $v)
+                  ' package-lock.bad.json >/dev/null
 
-            - name: Run PowerShell scanner on BAD fixture (with deep verify)
+            - name: Run PowerShell scanner on BAD (force local list)
               shell: pwsh
               run: |
-                  Set-StrictMode -Version Latest
                   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
                   Copy-Item package-lock.bad.json package-lock.json -Force
 
-                  Write-Host "== Verify copied package-lock.json (BAD) =="
-                  "bytes: " + (Get-Item package-lock.json).Length
-                  "md5:   " + (Get-FileHash -Path package-lock.json -Algorithm MD5).Hash.ToLower()
-                  "sha256:" + (Get-FileHash -Path package-lock.json -Algorithm SHA256).Hash.ToLower()
-
-                  # Byte-genauer Vergleich
-                  $cmp = & fc.exe /b package-lock.bad.json package-lock.json
-                  if ($LASTEXITCODE -eq 0) {
-                    "IDENTICAL"
-                  } else {
-                    "DIFFERS"
-                    "=== fc /b output ==="
-                    $cmp | Out-String | Write-Host
-                    "=== hexdump A (bad) ==="
-                    Format-Hex -Path package-lock.bad.json -Count 256 | Out-String | Write-Host
-                    "=== hexdump B (used) ==="
-                    Format-Hex -Path package-lock.json -Count 256 | Out-String | Write-Host
-                  }
-
-                  # CR (0x0D) zählen
-                  $bytes = [System.IO.File]::ReadAllBytes("package-lock.json")
-                  "CR-count: " + ($bytes | Where-Object { $_ -eq 13 }).Count
-
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt"
                   $text = $out -join "`n"
                   Set-Content -Path pwsh_bad.txt -Value $text -NoNewline
 
@@ -338,40 +344,11 @@ jobs:
                     throw "Expected at least one match with BAD fixture"
                   }
 
-            - name: Upload scanned BAD file (exact input)
-              uses: actions/upload-artifact@v4
-              with:
-                  name: windows-scanned-bad-input
-                  path: package-lock.json
-                  if-no-files-found: error
-                  retention-days: 14
-
-            - name: Run PowerShell scanner on GOOD fixture (with deep verify)
+            - name: Run PowerShell scanner on GOOD (force local list)
               shell: pwsh
               run: |
-                  Set-StrictMode -Version Latest
                   Copy-Item package-lock.good.json package-lock.json -Force
-
-                  Write-Host "== Verify copied package-lock.json (GOOD) =="
-                  "bytes: " + (Get-Item package-lock.json).Length
-                  "md5:   " + (Get-FileHash -Path package-lock.json -Algorithm MD5).Hash.ToLower()
-                  "sha256:" + (Get-FileHash -Path package-lock.json -Algorithm SHA256).Hash.ToLower()
-
-                  $cmp = & fc.exe /b package-lock.good.json package-lock.json
-                  if ($LASTEXITCODE -eq 0) {
-                    "IDENTICAL"
-                  } else
-                    {
-                      "DIFFERS"
-                      "=== fc /b output ==="
-                      $cmp | Out-String | Write-Host
-                      "=== hexdump A (good) ==="
-                      Format-Hex -Path package-lock.good.json -Count 256 | Out-String | Write-Host
-                      "=== hexdump B (used) ==="
-                      Format-Hex -Path package-lock.json -Count 256 | Out-String | Write-Host
-                    }
-
-                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt"
+                  $out = & .\compromised.ps1 -Cache "$PWD\compromised-packages.txt" -ListUrl "file:///$($PWD -replace '\\','/')/compromised-packages.txt"
                   $text = $out -join "`n"
                   Set-Content -Path pwsh_good.txt -Value $text -NoNewline
                   if ($text -match 'Total:\s+([1-9]\d*)\s+match\(es\)') {
@@ -382,14 +359,6 @@ jobs:
                     Write-Host $text
                     throw "Expected the ''No compromised packages'' message in GOOD fixture"
                   }
-
-            - name: Upload scanned GOOD file (exact input)
-              uses: actions/upload-artifact@v4
-              with:
-                  name: windows-scanned-good-input
-                  path: package-lock.json
-                  if-no-files-found: error
-                  retention-days: 14
 
             - name: Upload logs (Windows)
               uses: actions/upload-artifact@v4
